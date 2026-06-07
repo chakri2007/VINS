@@ -13,7 +13,7 @@ class FeatureExtractor:
         if "FAST" in self.method:
             self.fast_detector = FastDetector()
         if "KLT" in self.method:
-            self.klt_tracker = KltTracker()
+            self.klt_tracker = KltTracker(max_level=3, win_size=(21, 21))
         if "ORB" in self.method:
             self.orb_tracker = OrbTracker()
             self.prev_orb_descriptors = None # ORB needs to store its last descriptors

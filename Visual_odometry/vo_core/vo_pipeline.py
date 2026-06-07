@@ -4,7 +4,7 @@ import cv2
 
 from feature_extraction.feature_extractor import FeatureExtractor
 from feature_database.database import FeatureDatabase
-from motion_estimation.estimator import MotionEstimator
+#from motion_estimation.estimator import MotionEstimator
 
 class VisualOdometryPipeline:
     def __init__(self, calibration_data, mode="mono"):
@@ -22,8 +22,8 @@ class VisualOdometryPipeline:
             [0,                  0,                  1]
         ], dtype=np.float32)
        
-        self.extractor = None 
-        self.database = None  
+        self.extractor = FeatureExtractor()
+        self.database = FeatureDatabase()  
         self.estimator = None 
         
         self.current_pose = np.eye(4, dtype=np.float32) # T_world_body
@@ -34,7 +34,7 @@ class VisualOdometryPipeline:
         if not self.is_initialized:
             self.handle_initialization(gray_frame, timestamp)
             print("System not intialized yet.")
-            return
+            return None
     
         prev_frame, prev_points, prev_ids = self.database.get_active_tracks()
         
@@ -66,7 +66,7 @@ class VisualOdometryPipeline:
         
         self.database.set_reference_frame(gray_frame)
 
-        active_feature_history_map = self.database.get_active_feature_histories
+        active_feature_history_map = self.database.get_active_feature_histories()
 
         return active_feature_history_map, self.K, self.distortion_coeffs
 

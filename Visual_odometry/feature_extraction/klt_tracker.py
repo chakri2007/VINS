@@ -3,10 +3,10 @@ import cv2
 import numpy as np
 
 class KltTracker:
-    def __init__(self):
+    def __init__(self, max_level, win_size):
         self.lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
+            winSize=win_size,
+            maxLevel=max_level,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
 

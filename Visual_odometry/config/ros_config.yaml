@@ -1,10 +1,10 @@
 vo_mode: "mono" #mono or stereo
 
 # Topic Names
-left_camera_topic: "/camera/left/image_raw"
+left_camera_topic: "/left/downsample_raw"
 right_camera_topic: "/camera/right/image_raw" # Ignored if mode is mono
 
 # Paths to Sensor Calibration Files
-left_camera_config_path: "/path/to/config/left_camera.yaml"
-right_camera_config_path: "/path/to/config/right_camera.yaml"
-imu_config_path: "/path/to/config/imu.yaml"
+left_camera_config_path: "/home/icgel/vio/VINS/Visual_odometry/config/left_camera.yaml"
+right_camera_config_path: "/home/icgel/vio/VINS/Visual_odometry/config/right_camera.yaml"
+imu_config_path: "/home/icgel/vio/VINS/Visual_odometry/config/imu.yaml"

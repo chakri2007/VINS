@@ -4,6 +4,7 @@ from sensor_msgs.msg import Image
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
+from rclpy.time import Time
 
 class VOFeatureVisualizer(Node):
     def __init__(self):
@@ -39,7 +40,8 @@ class VOFeatureVisualizer(Node):
                     cv2.line(undistorted_image, pt_start, pt_end, (0, 255, 255), 1)
 
         img_msg = self.bridge.cv2_to_imgmsg(undistorted_image, encoding='bgr8')
-        img_msg.header.stamp = timestamp
+        ros_time_obj = Time(seconds=timestamp).to_msg()
+        img_msg.header.stamp = ros_time_obj
         img_msg.header.frame_id = "camera_link"
         
         self.image_pub.publish(img_msg)

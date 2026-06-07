@@ -1,18 +1,27 @@
 import cv2
 import numpy as np
+from .ssc import ssc
 
 class FastDetector:
-    def __init__(self, threshold=20, nonmax_suppression=True):
-        self.fast = cv2.FastFeatureDetector_create(
-            threshold=threshold, 
-            nonmaxSuppression=nonmax_suppression
-        )
-
+    def __init__(self,target_num_features = 150, num_feature_tolerance = 0.1):
+        self.fast = cv2.FastFeatureDetector_create( 
+                        threshold=25,
+                        nonmaxSuppression=True
+                        )
+        self.taget_num_features = target_num_features
+        self.num_features_tolerance = num_feature_tolerance
     def detect(self, gray_frame, mask=None):
-        keypoints = self.fast.detect(gray_frame, mask=mask)
-        
-        # Convert OpenCV Keypoint objects to clean Nx2 NumPy coordinates
+
+        img_rows, img_cols = gray_frame.shape[:2]
+        keypoints = sorted(self.fast.detect(gray_frame, mask=mask), key=lambda x: x.response, reverse=True)
         if len(keypoints) == 0:
             return np.empty((0, 2), dtype=np.float32)
+        keypoints = ssc(
+                    keypoints=keypoints, 
+                    num_ret_points=self.taget_num_features, 
+                    tolerance=self.num_features_tolerance, 
+                    cols=img_cols, 
+                    rows=img_rows
+                )
             
         return np.array([kp.pt for kp in keypoints], dtype=np.float32)

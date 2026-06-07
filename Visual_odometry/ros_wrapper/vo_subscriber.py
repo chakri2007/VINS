@@ -4,15 +4,26 @@ from sensor_msgs.msg import Image
 import yaml
 import cv2
 from cv_bridge import CvBridge
+import os, sys
 
-# Import your core pipeline (which remains independent of ROS2)
-from .core.pipeline import VisualOdometryPipeline
+from vo_visualizer import VOFeatureVisualizer
+
+# Gets the absolute path of the directory containing your current script
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# Moves up to the 'Visual_odometry' root directory
+project_root = os.path.abspath(os.path.join(current_dir, ".."))
+
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+# Now you can cleanly import it
+from vo_core.vo_pipeline import VisualOdometryPipeline
 
 class VisualOdometryNode(Node):
     def __init__(self):
         super().__init__('vo_subscriber_node')
         self.bridge = CvBridge()
-        config_path = "config/ros_config.yaml" 
+        config_path = "/home/icgel/vio/VINS/Visual_odometry/config/ros_config.yaml" 
         with open(config_path, 'r') as file:
             self.ros_config = yaml.safe_load(file)
             
@@ -20,6 +31,7 @@ class VisualOdometryNode(Node):
         self.get_logger().info(f"Initializing Visual Odometry Node in [{self.mode.upper()}] mode.")
         calibration_data = self.load_calibration_files()
         self.vo_pipeline = VisualOdometryPipeline(calibration_data, mode=self.mode)
+        self.visualizer = VOFeatureVisualizer()
 
         if self.mode == "mono":
             self.image_sub = self.create_subscription(
@@ -53,11 +65,15 @@ class VisualOdometryNode(Node):
         return calib
 
     def mono_image_callback(self, msg):
+
         timestamp = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
         
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-        tracks, K, D = self.vo_pipeline.process_frame_mono(cv_image,timestamp)
+        result = self.vo_pipeline.process_frame_mono(cv_image,timestamp)
+        if result is None:
+            return
+        tracks, K, D = result
         self.visualizer.publish_feature_tracks(cv_image, timestamp, tracks, K, D)
 
     def stereo_image_callback(self, left_msg, right_msg):
