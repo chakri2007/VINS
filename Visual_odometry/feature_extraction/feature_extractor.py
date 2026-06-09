@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 
 from .fast_detector import FastDetector
 from .klt_tracker import KltTracker
-from .orb_tracker import OrbTracker
+#from .orb_tracker import OrbTracker
 from .gridder import ImageGridder, DeficitCell
 
 

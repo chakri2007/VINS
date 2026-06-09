@@ -16,12 +16,12 @@ class FastDetector:
         keypoints = sorted(self.fast.detect(gray_frame, mask=mask), key=lambda x: x.response, reverse=True)
         if len(keypoints) == 0:
             return np.empty((0, 2), dtype=np.float32)
-        keypoints = ssc(
-                    keypoints=keypoints, 
-                    num_ret_points=self.taget_num_features, 
-                    tolerance=self.num_features_tolerance, 
-                    cols=img_cols, 
-                    rows=img_rows
-                )
+        # keypoints = ssc(
+        #             keypoints=keypoints, 
+        #             num_ret_points=self.taget_num_features, 
+        #             tolerance=self.num_features_tolerance, 
+        #             cols=img_cols, 
+        #             rows=img_rows
+        #         )
             
         return np.array([kp.pt for kp in keypoints], dtype=np.float32)
