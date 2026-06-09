@@ -100,3 +100,41 @@ class ImageGridder:
             y2 = min(self.frame_h, y2 + self.border_pad)
 
         return (x1, y1, x2 - x1, y2 - y1)
+
+    def get_overcrowded_evictions(
+        self,
+        tracked_points: np.ndarray,   # shape (N, 2)
+        track_ids: np.ndarray,        # shape (N,)
+        track_ages: np.ndarray,       # shape (N,)
+        max_features_per_cell: int = None,
+    ) -> np.ndarray:
+        """
+        Returns IDs of tracks to evict from over-occupied cells.
+        Eviction policy: keep oldest tracks (longest baseline), drop youngest.
+        """
+        if max_features_per_cell is None:
+            max_features_per_cell = self.min_features_per_cell * 2  # 2x headroom
+
+        if len(tracked_points) == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        pts = np.asarray(tracked_points, dtype=np.float32)
+        col_idx = np.clip(np.digitize(pts[:, 0], self._x_edges[1:]), 0, self.cell_cols - 1)
+        row_idx = np.clip(np.digitize(pts[:, 1], self._y_edges[1:]), 0, self.cell_rows - 1)
+
+        evict_ids = []
+        for r in range(self.cell_rows):
+            for c in range(self.cell_cols):
+                mask = (row_idx == r) & (col_idx == c)
+                cell_indices = np.where(mask)[0]
+
+                if len(cell_indices) <= max_features_per_cell:
+                    continue
+
+                # Sort by age descending — keep oldest, evict youngest
+                ages_in_cell = track_ages[cell_indices]
+                sorted_order = np.argsort(-ages_in_cell)   # descending age
+                evict_local = sorted_order[max_features_per_cell:]
+                evict_ids.extend(track_ids[cell_indices[evict_local]].tolist())
+
+        return np.array(evict_ids, dtype=np.int64)

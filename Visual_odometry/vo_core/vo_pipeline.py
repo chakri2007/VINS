@@ -30,6 +30,7 @@ class VisualOdometryPipeline:
         self.current_pose = np.eye(4, dtype=np.float32)  # T_world_body
 
         self._global_track_min = 50
+        self._gridder_max_per_cell = self.extractor.gridder.min_features_per_cell * 2
 
     def process_frame_mono(self, cv_frame: np.ndarray, timestamp: float):
         gray_frame = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
@@ -57,6 +58,20 @@ class VisualOdometryPipeline:
 
         self.database.update_active_positions(tracked_ids, tracked_curr_pts)
         self.database.purge_tracks(lost_ids)
+        evict_ids = self.extractor.gridder.get_overcrowded_evictions(
+        tracked_points=tracked_curr_pts,
+        track_ids=tracked_ids,
+        track_ages=self.database.ages[
+                np.isin(self.database.ids, tracked_ids)
+            ],
+            max_features_per_cell=self.gridder_max_per_cell,   # set to 2 * min_features_per_cell
+        )
+        if len(evict_ids) > 0:
+            self.database.purge_tracks(evict_ids)
+            # recompute tracked_curr_pts for the vacancy check below
+            keep_mask = ~np.isin(tracked_ids, evict_ids)
+            tracked_curr_pts = tracked_curr_pts[keep_mask]
+            tracked_ids = tracked_ids[keep_mask]
 
         new_grid_points = self.extractor.extract_features_in_empty_cells(
             gray_frame=gray_frame,
