@@ -108,10 +108,6 @@ class ImageGridder:
         track_ages: np.ndarray,       # shape (N,)
         max_features_per_cell: int = None,
     ) -> np.ndarray:
-        """
-        Returns IDs of tracks to evict from over-occupied cells.
-        Eviction policy: keep oldest tracks (longest baseline), drop youngest.
-        """
         if max_features_per_cell is None:
             max_features_per_cell = self.min_features_per_cell * 2  # 2x headroom
 

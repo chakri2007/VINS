@@ -88,4 +88,14 @@ class FeatureDatabase:
         self.reference_frame = gray_frame.copy()
 
     def get_active_feature_histories(self):
-        return self.history_map.copy()
+        return {fid: list(history) for fid, history in self.history_map.items()}
+    
+    def get_active_positions(self):
+        return self.points.copy()
+    
+    def get_snapshot_for_estimator(self):
+        return {
+            fid: list(history)
+            for fid, history in self.history_map.items()
+            if len(history) >= 2
+        }

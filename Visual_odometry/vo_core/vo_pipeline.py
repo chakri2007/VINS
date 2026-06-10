@@ -1,9 +1,12 @@
 import numpy as np
 import cv2
 
+from queue import Queue
+from threading import Thread
+
 from feature_extraction.feature_extractor import FeatureExtractor
 from feature_database.database import FeatureDatabase
-
+from motion_estimation.RANSAC import RANSACMotionEstimator
 
 class VisualOdometryPipeline:
     def __init__(self, calibration_data, mode="mono", frame_size=(640, 480)):
@@ -30,7 +33,16 @@ class VisualOdometryPipeline:
         self.current_pose = np.eye(4, dtype=np.float32)  # T_world_body
 
         self._global_track_min = 50
-        self._gridder_max_per_cell = self.extractor.gridder.min_features_per_cell * 2
+        self.gridder_max_per_cell = self.extractor.gridder.min_features_per_cell * 2
+
+        self._estimation_queue = Queue(maxsize=2)  # bounded — drop if estimator falls behind
+        self._estimator_thread = Thread(
+            target=self._estimation_loop,
+            daemon=True
+        )
+        self._estimator_thread.start()
+
+        self.ransac = RANSACMotionEstimator(self.K, self.distortion_coeffs)
 
     def process_frame_mono(self, cv_frame: np.ndarray, timestamp: float):
         gray_frame = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
@@ -39,6 +51,8 @@ class VisualOdometryPipeline:
             self.handle_initialization(gray_frame, timestamp)
             print("System not initialised yet.")
             return None
+        
+        self._drain_result_queue()
 
         prev_frame, prev_points, prev_ids = self.database.get_active_tracks()
 
@@ -58,6 +72,13 @@ class VisualOdometryPipeline:
 
         self.database.update_active_positions(tracked_ids, tracked_curr_pts)
         self.database.purge_tracks(lost_ids)
+
+        #Estimation - input
+        snapshot = self.build_estimation_snapshot(timestamp)
+
+        if not self._estimation_queue.full():
+            self._estimation_queue.put_nowait(snapshot)
+
         evict_ids = self.extractor.gridder.get_overcrowded_evictions(
         tracked_points=tracked_curr_pts,
         track_ids=tracked_ids,
@@ -101,7 +122,43 @@ class VisualOdometryPipeline:
         active_feature_history_map = self.database.get_active_feature_histories()
         return active_feature_history_map, self.K, self.distortion_coeffs
 
-    # ------------------------------------------------------------------
+    def _estimation_loop(self):
+        while True:
+            snapshot = self._estimation_queue.get()
+            if snapshot is None:
+                break
+            self.ransac_estimation(snapshot)
+    
+    def _run_ransac_and_estimate(self, snapshot):
+        result = self.ransac.estimate(snapshot['histories'])
+
+        if result is None:
+            return
+
+        if len(result['outlier_ids']) > 0 and not self._result_queue.full():
+            self._result_queue.put_nowait({
+                'outlier_ids': result['outlier_ids'],
+            })
+
+        # Pose chaining — wire up when ready
+        R, t = result['R'], result['t']
+        # self._update_pose(R, t)
+        print(f"Estimated pose update: R=\n{R}\nt={t.ravel()}\n")
+    
+    def _drain_result_queue(self):
+        while True:
+            try:
+                result = self._result_queue.get_nowait()
+                self.database.purge_tracks(result['outlier_ids'])
+            except Empty:
+                break
+    
+    def _build_estimation_snapshot(self, timestamp):
+        return {
+            'timestamp': timestamp,
+            'histories': self.database.get_snapshot_for_estimator(),
+        }
+
 
     def process_frame_stereo(self, cv_frame_left, cv_frame_right, timestamp):
         pass
@@ -113,5 +170,6 @@ class VisualOdometryPipeline:
         print(f"VO Pipeline initialised successfully at timestamp: {timestamp}")
 
     def shutdown(self):
-        """Cleanly tear down the thread pool inside the extractor."""
+        self._estimation_queue.put(None)   # signal estimator thread to exit
+        self._estimator_thread.join(timeout=2.0)
         self.extractor.shutdown()
