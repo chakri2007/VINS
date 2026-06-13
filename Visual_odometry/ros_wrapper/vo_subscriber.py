@@ -8,15 +8,15 @@ import os, sys
 
 from vo_visualizer import VOFeatureVisualizer
 
-# Gets the absolute path of the directory containing your current script
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Moves up to the 'Visual_odometry' root directory
+
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Now you can cleanly import it
+
 from vo_core.vo_pipeline import VisualOdometryPipeline
 
 class VisualOdometryNode(Node):
@@ -24,6 +24,7 @@ class VisualOdometryNode(Node):
         super().__init__('vo_subscriber_node')
         self.bridge = CvBridge()
         config_path = "/home/icgel/vio/VINS/Visual_odometry/config/ros_config.yaml" 
+        
         with open(config_path, 'r') as file:
             self.ros_config = yaml.safe_load(file)
             
@@ -73,11 +74,16 @@ class VisualOdometryNode(Node):
         result = self.vo_pipeline.process_frame_mono(cv_image,timestamp)
         if result is None:
             return
-        tracks, K, D = result
-        self.visualizer.publish_feature_tracks(cv_image, timestamp, tracks, K, D)
+        
+
+        self.visualizer.publish_feature_tracks(cv_image, timestamp, result['tracks'], result['K'], result['D'])
+
 
     def stereo_image_callback(self, left_msg, right_msg):
         pass
+
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = VisualOdometryNode()
