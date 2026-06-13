@@ -47,10 +47,10 @@ class VisualOdometryPipeline:
         )
 
         self.keyframe_selector = KeyframeSelector(
-            min_parallax_px  = 30.0,
-            min_rotation_deg = 3.0,
+            min_parallax_px  = 15.0,
+            min_rotation_deg = 1.0,
             min_frames_gap   = 3,
-            min_inliers      = 50,
+            min_inliers      = 20,
         )
 
         self.triangulator = Triangulator(
@@ -154,6 +154,7 @@ class VisualOdometryPipeline:
                 self.database.add_new_tracks(fallback, gray_frame)
 
         self.database.set_reference_frame(gray_frame)
+        tracks = self.database.get_active_feature_histories()
 
         # ── Return state for external inspection ──────────────────────
         return {
@@ -163,9 +164,9 @@ class VisualOdometryPipeline:
             'n_landmarks'   : self.landmark_map.num_landmarks(),
             'n_keyframes'   : self.keyframe_selector.num_keyframes(),
             'landmark_summary': self.landmark_map.summary(),
-            'tracks': self.database.get_active_tracks(),
-            'K': self.camera.K,
-            'D': self.camera.D,
+            'tracks': tracks,
+            'K': self.K,
+            'D': self.distortion_coeffs,
         }
 
 
@@ -200,11 +201,13 @@ class VisualOdometryPipeline:
             ransac_result = packet['ransac_result']
             frame_idx     = packet['frame_idx']
 
+            #print(ransac_result)
+
             # ── Purge outliers ────────────────────────────────────────
             if ransac_result is not None:
                 outlier_ids = ransac_result.get('outlier_ids', np.array([]))
                 if len(outlier_ids) > 0:
-                    self.database.purge_tracks(outlier_ids)
+                    #self.database.purge_tracks(outlier_ids)
                     self.landmark_map.prune_feat_ids(outlier_ids)
 
             # ── Keyframe decision ─────────────────────────────────────
@@ -215,6 +218,7 @@ class VisualOdometryPipeline:
 
             # ── Triangulate if new keyframe ───────────────────────────
             if is_kf:
+                print("New Key Frame detected")
                 pair = self.keyframe_selector.get_last_two_keyframes()
                 if pair is not None:
                     kf_prev, kf_curr = pair
