@@ -3,13 +3,16 @@ import cv2
 
 from queue import Queue, Empty
 from threading import Thread
+from typing import Tuple, Optional
 
 from feature_extraction.feature_extractor import FeatureExtractor
 from feature_database.database import FeatureDatabase
 from motion_estimation.RANSAC import RANSACMotionEstimator
 from motion_estimation.keyframe_selector import KeyframeSelector
 from motion_estimation.Triangulator import Triangulator
+from motion_estimation.pnp_estimator import PnPEstimator
 from feature_database.landmark_map import LandmarkMap
+from motion_estimation.bundle_adjustment.bundle_adjustment import BundleAdjustment
 
 
 class VisualOdometryPipeline:
@@ -21,7 +24,7 @@ class VisualOdometryPipeline:
 
         # ── Calibration ───────────────────────────────────────────────
         self.left_calib        = calibration_data['left']
-        self.intrinsics        = self.left_calib['intrinsics']  # [fu,fv,cu,cv]
+        self.intrinsics        = self.left_calib['intrinsics']
         self.distortion_coeffs = np.array(
             self.left_calib['distortion_coefficients']
         )
@@ -35,7 +38,6 @@ class VisualOdometryPipeline:
             [0,                  0,                  1],
         ], dtype=np.float64)
 
-        # ── Modules ───────────────────────────────────────────────────
         self.extractor = FeatureExtractor(
             method="FAST+KLT", frame_size=frame_size
         )
@@ -58,12 +60,33 @@ class VisualOdometryPipeline:
             min_angle_deg=1.0,
         )
 
+        self.pnp = PnPEstimator(
+            K=self.K,
+            dist_coeffs=self.distortion_coeffs,
+            min_inliers=12,
+            reprojection_error_px=4.0,
+        )
+
         self.landmark_map = LandmarkMap(sliding_window_size=10)
 
-        # ── Threading ─────────────────────────────────────────────────
-        # Main thread  → puts snapshots here
+        self.ba = BundleAdjustment(
+            K=self.K,
+            max_iterations=50,
+            min_landmarks=15,
+            min_keyframes=3,
+            verbose=True,
+        )
+        self._ba_keyframe_interval = 3
+        self._kf_count_since_ba    = 0
+
+        self._phase = 'bootstrap'
+        self._min_landmarks_for_pnp = 20
+
+        self._current_R     = np.eye(3,    dtype=np.float64)
+        self._current_t     = np.zeros((3, 1), dtype=np.float64)
+        self._pose_from_pnp = False   # diagnostic flag
+
         self._estimation_queue = Queue(maxsize=2)
-        # Background thread → puts results here
         self._result_queue     = Queue(maxsize=8)
 
         self._estimator_thread = Thread(
@@ -72,28 +95,23 @@ class VisualOdometryPipeline:
         )
         self._estimator_thread.start()
 
-        # ── Misc ──────────────────────────────────────────────────────
         self._global_track_min    = 50
         self.gridder_max_per_cell = (
             self.extractor.gridder.min_features_per_cell * 2
         )
-        self._frame_idx = 0   # incremented every process_frame_mono call
+        self._frame_idx = 0
+
 
     def process_frame_mono(self, cv_frame: np.ndarray, timestamp: float):
         gray_frame = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
 
-        # ── Init on first frame ───────────────────────────────────────
         if not self.is_initialized:
             self._handle_initialization(gray_frame, timestamp)
             return None
 
         self._frame_idx += 1
-
-        # ── Drain previous RANSAC results ─────────────────────────────
-        # (outlier purging + keyframe/triangulation trigger)
         self._drain_result_queue()
 
-        # ── Feature tracking ──────────────────────────────────────────
         prev_frame, prev_points, prev_ids = self.database.get_active_tracks()
 
         curr_points, status = self.extractor.track_features(
@@ -114,12 +132,20 @@ class VisualOdometryPipeline:
         self.database.purge_tracks(lost_ids)
         self.landmark_map.prune_feat_ids(lost_ids)
 
-        # ── Send snapshot to RANSAC thread ────────────────────────────
+
+        self._update_phase()
+        if self._phase == 'tracking':
+            self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
+        else:
+            #update this to use current computed pose
+            self._current_R     = self.keyframe_selector._world_R.copy()
+            self._current_t     = self.keyframe_selector._world_t.copy()
+            self._pose_from_pnp = False
+
         snapshot = self._build_snapshot(timestamp)
         if not self._estimation_queue.full():
             self._estimation_queue.put_nowait(snapshot)
 
-        # ── Grid management ───────────────────────────────────────────
         evict_ids = self.extractor.gridder.get_overcrowded_evictions(
             tracked_points=tracked_curr_pts,
             track_ids=tracked_ids,
@@ -131,11 +157,10 @@ class VisualOdometryPipeline:
         if len(evict_ids) > 0:
             self.database.purge_tracks(evict_ids)
             self.landmark_map.prune_feat_ids(evict_ids)
-            keep_mask = ~np.isin(tracked_ids, evict_ids)
+            keep_mask        = ~np.isin(tracked_ids, evict_ids)
             tracked_curr_pts = tracked_curr_pts[keep_mask]
             tracked_ids      = tracked_ids[keep_mask]
 
-        # ── Fill empty grid cells ─────────────────────────────────────
         new_grid_points = self.extractor.extract_features_in_empty_cells(
             gray_frame=gray_frame,
             tracked_points=tracked_curr_pts,
@@ -143,10 +168,9 @@ class VisualOdometryPipeline:
         if len(new_grid_points) > 0:
             self.database.add_new_tracks(new_grid_points, gray_frame)
 
-        # ── Fallback: detect if total track count is too low ──────────
         total_tracked = len(tracked_ids) + len(new_grid_points)
         if total_tracked < self._global_track_min:
-            all_pts = self.database.get_active_positions()
+            all_pts  = self.database.get_active_positions()
             fallback = self.extractor.detect_new_features(
                 gray_frame, existing_points=all_pts
             )
@@ -156,36 +180,84 @@ class VisualOdometryPipeline:
         self.database.set_reference_frame(gray_frame)
         tracks = self.database.get_active_feature_histories()
 
-        # ── Return state for external inspection ──────────────────────
         return {
-            'frame_idx'     : self._frame_idx,
-            'timestamp'     : timestamp,
-            'n_tracked'     : total_tracked,
-            'n_landmarks'   : self.landmark_map.num_landmarks(),
-            'n_keyframes'   : self.keyframe_selector.num_keyframes(),
+            'frame_idx'       : self._frame_idx,
+            'timestamp'       : timestamp,
+            'n_tracked'       : total_tracked,
+            'n_landmarks'     : self.landmark_map.num_landmarks(),
+            'n_keyframes'     : self.keyframe_selector.num_keyframes(),
+            'phase'           : self._phase,
+            'pose_from_pnp'   : self._pose_from_pnp,
+            'R'               : self._current_R.copy(),
+            't'               : self._current_t.copy(),
             'landmark_summary': self.landmark_map.summary(),
-            'tracks': tracks,
-            'K': self.K,
-            'D': self.distortion_coeffs,
+            'tracks'          : tracks,
+            'K'               : self.K,
+            'D'               : self.distortion_coeffs,
         }
 
+
+    def _estimate_pose_pnp(
+        self,
+        tracked_ids: np.ndarray,       # (N,)   feature IDs tracked this frame
+        tracked_curr_pts: np.ndarray,  # (N, 2) their pixel positions
+    ):
+        pts3d_list = []
+        pts2d_list = []
+
+        for feat_id, pt2d in zip(tracked_ids, tracked_curr_pts):
+            lm_id = self.landmark_map.feat_to_lm.get(int(feat_id))
+            if lm_id is None:
+                continue
+            if lm_id not in self.landmark_map.landmarks:
+                continue
+            pts3d_list.append(self.landmark_map.landmarks[lm_id])
+            pts2d_list.append(pt2d)
+
+        if len(pts3d_list) < self.pnp.min_inliers:
+            self._pose_from_pnp = False
+            return
+
+        pts3d = np.array(pts3d_list, dtype=np.float64)
+        pts2d = np.array(pts2d_list, dtype=np.float64)
+
+        result = self.pnp.estimate(pts3d=pts3d, pts2d=pts2d)
+
+        if result is None:
+            self._pose_from_pnp = False
+            print(f"[PnP] Failed frame {self._frame_idx} "
+                  f"({len(pts3d)} candidates) — keeping last pose")
+            return
+
+        R, t, inlier_mask = result
+        self._current_R     = R
+        self._current_t     = t
+        self._pose_from_pnp = True
+        print(f"[PnP] Frame {self._frame_idx}: "
+              f"{inlier_mask.sum()}/{len(pts3d)} inliers")
+
+    def _update_phase(self):
+        if self._phase == 'bootstrap':
+            if self.landmark_map.num_landmarks() >= self._min_landmarks_for_pnp:
+                self._phase = 'tracking'
+                print(f"[Pipeline] bootstrap → tracking "
+                      f"({self.landmark_map.num_landmarks()} landmarks)")
 
     def _estimation_loop(self):
         while True:
             snapshot = self._estimation_queue.get()
             if snapshot is None:
-                break   # shutdown signal
+                break
 
-            histories  = snapshot['histories']
-            frame_idx  = snapshot['frame_idx']
-            timestamp  = snapshot['timestamp']
-
+            histories     = snapshot['histories']
+            frame_idx     = snapshot['frame_idx']
+            timestamp     = snapshot['timestamp']
             ransac_result = self.ransac.estimate(histories)
 
             result_packet = {
                 'frame_idx'    : frame_idx,
                 'timestamp'    : timestamp,
-                'ransac_result': ransac_result,   # may be None
+                'ransac_result': ransac_result,
             }
 
             if not self._result_queue.full():
@@ -201,41 +273,68 @@ class VisualOdometryPipeline:
             ransac_result = packet['ransac_result']
             frame_idx     = packet['frame_idx']
 
-            #print(ransac_result)
-
-            # ── Purge outliers ────────────────────────────────────────
             if ransac_result is not None:
                 outlier_ids = ransac_result.get('outlier_ids', np.array([]))
                 if len(outlier_ids) > 0:
-                    #self.database.purge_tracks(outlier_ids)
                     self.landmark_map.prune_feat_ids(outlier_ids)
 
-            # ── Keyframe decision ─────────────────────────────────────
             is_kf = self.keyframe_selector.process(
                 frame_idx=frame_idx,
                 ransac_result=ransac_result,
             )
 
-            # ── Triangulate if new keyframe ───────────────────────────
             if is_kf:
-                print("New Key Frame detected")
+                print(f"[Pipeline] New keyframe: frame {frame_idx}")
                 pair = self.keyframe_selector.get_last_two_keyframes()
+
                 if pair is not None:
                     kf_prev, kf_curr = pair
+
+                    if self._phase == 'tracking':
+                        kf_frame_idx = kf_curr['frame_idx']
+                        if kf_frame_idx in self._pose_history:
+                            R_at_kf, t_at_kf = self._pose_history[kf_frame_idx]
+                            kf_curr['R'] = R_at_kf.copy()
+                            kf_curr['t'] = t_at_kf.copy()
+
                     tri_result = self.triangulator.triangulate(kf_prev, kf_curr)
                     if tri_result is not None:
                         self.landmark_map.add_triangulation_result(tri_result)
+                        self._register_new_observations(kf_curr)
                         print(f"[Pipeline] Triangulated "
-                              f"{len(tri_result['landmarks'])} new landmarks. "
+                              f"{len(tri_result['landmarks'])} landmarks. "
                               f"Total: {self.landmark_map.num_landmarks()}")
 
-            # ── Prune landmark map to active window ───────────────────
-            active_frames = [
-                kf['frame_idx']
-                for kf in self.keyframe_selector.get_all_keyframes()
-            ]
-            if active_frames:
-                self.landmark_map.prune_outside_window(active_frames)
+                    self._update_phase()
+
+                active_frames = [
+                    kf['frame_idx']
+                    for kf in self.keyframe_selector.get_all_keyframes()
+                ]
+                if active_frames:
+                    self.landmark_map.prune_outside_window(active_frames)
+
+                self._kf_count_since_ba += 1
+                if self._kf_count_since_ba >= self._ba_keyframe_interval:
+                    self._kf_count_since_ba = 0
+                    ran = self.ba.run(
+                        landmark_map=self.landmark_map,
+                        keyframe_selector=self.keyframe_selector,
+                    )
+                    if ran:
+                        print("[Pipeline] BA completed.")
+
+
+    def _register_new_observations(self, kf: dict):
+        for feat_id, pt in zip(kf['feat_ids'], kf['pts']):
+            lm_id = self.landmark_map.feat_to_lm.get(int(feat_id))
+            if lm_id is not None:
+                self.landmark_map.add_observation(
+                    lm_id=lm_id,
+                    frame_idx=kf['frame_idx'],
+                    u=float(pt[0]),
+                    v=float(pt[1]),
+                )
 
     def _build_snapshot(self, timestamp: float) -> dict:
         return {
@@ -251,20 +350,20 @@ class VisualOdometryPipeline:
         print(f"[Pipeline] Initialized at timestamp={timestamp:.3f}")
 
 
+    def get_current_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._current_R.copy(), self._current_t.copy()
 
     def get_landmarks_for_ba(self):
-        """{ lm_id: X(3,) } — up-to-scale."""
         return self.landmark_map.get_landmarks_for_ba()
 
     def get_observations_for_ba(self):
-        """{ lm_id: [(frame_idx, u, v), ...] }"""
         return self.landmark_map.get_observations_for_ba()
 
     def get_keyframe_poses(self):
         return self.keyframe_selector.get_all_keyframes()
 
     def process_frame_stereo(self, cv_frame_left, cv_frame_right, timestamp):
-        pass   # future implementation
+        pass
 
     def shutdown(self):
         self._estimation_queue.put(None)

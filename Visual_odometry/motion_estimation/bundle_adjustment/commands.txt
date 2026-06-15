@@ -1,0 +1,12 @@
+# Install dependencies on Pi CM5 (Debian/Ubuntu)
+sudo apt install libceres-dev libeigen3-dev
+
+pip install pybind11
+
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j4
+
+# This produces ba_solver.cpython-3xx-arm-linux-gnueabihf.so
+# Copy it to your motion_estimation/bundle_adjustment/ folder
