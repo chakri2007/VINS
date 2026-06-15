@@ -100,6 +100,7 @@ class VisualOdometryPipeline:
             self.extractor.gridder.min_features_per_cell * 2
         )
         self._frame_idx = 0
+        self._pose_history = {}
 
 
     def process_frame_mono(self, cv_frame: np.ndarray, timestamp: float):
