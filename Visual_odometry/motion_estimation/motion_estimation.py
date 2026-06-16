@@ -1,450 +1,383 @@
+"""
+motion_estimator.py
+───────────────────
+Produces the final 3-D pose (x, y, z) + orientation (qx, qy, qz, qw)
+at camera frame rate.
+
+Two loops
+─────────
+FAST  (every frame)   compute_pose(R, t, timestamp)
+        ↳ apply stored scale → metric position
+        ↳ apply pending BA correction if present
+        ↳ convert R → quaternion
+        ↳ return Pose dataclass
+
+SLOW  (keyframe rate) on_new_keyframe(keyframe_poses, timestamp)
+        ↳ if ≥ MIN_KF keyframes:
+              call via.run_between(poses, kf_timestamps)
+                  VIA fetches chunk.raw_samples from chunk_db per pair
+                  VIA calls preintegrate() on real raw data
+                  VIA returns (s, g_c0, velocities)
+              write scale / gravity / velocities to VIOState
+
+CORRECTION (after BA) on_ba_updated(ba_keyframe_poses, map_points, timestamp)
+        ↳ compute delta between pre-BA and post-BA pose of reference KF
+        ↳ write BACorrection to VIOState
+        ↳ next compute_pose() call automatically applies the delta
+"""
+
+import threading
 import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+
+from Visual_odometry.vo_core.vo_state    import VIOState, BACorrection
+from Visual_odometry.Inertial.imu_chunk_db import IMUChunkDatabase
+from Visual_odometry.Inertial.visual_inertial_alignment import VisualInertialAlignment
 
 
-# Type aliases
-FrameIdx  = int
-FeatId    = int
-Pose      = Tuple[np.ndarray, np.ndarray]   # (R 3x3, t 3x1)
-Obs       = Tuple[FrameIdx, float, float]    # (frame_idx, u, v)
+# ── Output type ───────────────────────────────────────────────────────────────
 
+@dataclass
+class Pose:
+    """Final metric pose output, produced every camera frame."""
+    x: float
+    y: float
+    z: float
+    qx: float
+    qy: float
+    qz: float
+    qw: float
+    timestamp:    float
+    scale_status: str   # 'unscaled' | 'scaled' | 'ba_fused'
+
+
+# ── Quaternion helper ─────────────────────────────────────────────────────────
+
+def _rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
+    """3×3 rotation matrix → (qx, qy, qz, qw). Shepperd's method."""
+    trace = R[0,0] + R[1,1] + R[2,2]
+    if trace > 0:
+        s  = 0.5 / np.sqrt(trace + 1.0)
+        qw = 0.25 / s
+        qx = (R[2,1] - R[1,2]) * s
+        qy = (R[0,2] - R[2,0]) * s
+        qz = (R[1,0] - R[0,1]) * s
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s  = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+        qw = (R[2,1] - R[1,2]) / s
+        qx = 0.25 * s
+        qy = (R[0,1] + R[1,0]) / s
+        qz = (R[0,2] + R[2,0]) / s
+    elif R[1,1] > R[2,2]:
+        s  = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+        qw = (R[0,2] - R[2,0]) / s
+        qx = (R[0,1] + R[1,0]) / s
+        qy = 0.25 * s
+        qz = (R[1,2] + R[2,1]) / s
+    else:
+        s  = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+        qw = (R[1,0] - R[0,1]) / s
+        qx = (R[0,2] + R[2,0]) / s
+        qy = (R[1,2] + R[2,1]) / s
+        qz = 0.25 * s
+    return float(qx), float(qy), float(qz), float(qw)
+
+
+# ── MotionEstimator ───────────────────────────────────────────────────────────
 
 class MotionEstimator:
+    """
+    Wires together VIOState, IMUChunkDatabase and VisualInertialAlignment
+    to produce frame-rate metric pose estimates.
+
+    Parameters
+    ──────────
+    vio_state      : shared VIOState instance
+    via            : VisualInertialAlignment (already holds chunk_db reference)
+    min_kf_for_via : minimum keyframes before attempting alignment (≥ 5)
+    realign_every  : re-run VIA every N new keyframes after first success
+                     (0 = align once and lock scale)
+    verbose        : print debug info
+    """
+
+    MIN_KF_DEFAULT = 5
+
     def __init__(
         self,
-        K: np.ndarray,                  # (3,3) camera intrinsics
-        dist_coeffs: np.ndarray,        # distortion coefficients
-        sliding_window_size: int = 10,
-        min_init_parallax_px: float = 20.0,   # minimum median parallax for init
-        min_init_inliers: int = 50,
-        min_pnp_inliers: int = 20,
-        min_triangulation_angle_deg: float = 1.0,
+        vio_state:      VIOState,
+        via:            VisualInertialAlignment,
+        min_kf_for_via: int  = MIN_KF_DEFAULT,
+        realign_every:  int  = 10,
+        verbose:        bool = True,
     ):
-        self.K           = K.astype(np.float64)
-        self.dist_coeffs = dist_coeffs.astype(np.float64)
-        self.window_size = sliding_window_size
+        self._state         = vio_state
+        self._via           = via
+        self._min_kf        = max(min_kf_for_via, 5)
+        self._realign_every = realign_every
+        self._verbose       = verbose
 
-        self.min_init_parallax_px        = min_init_parallax_px
-        self.min_init_inliers            = min_init_inliers
-        self.min_pnp_inliers             = min_pnp_inliers
-        self.min_triangulation_angle_deg = min_triangulation_angle_deg
+        # Pre-BA pose snapshot for computing BA correction delta
+        # {frame_idx: (p_bar np.ndarray, R np.ndarray)}
+        self._pre_ba_poses: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
-        self.is_initialized = False
+        self._kf_since_last_via = 0
+        self._via_lock = threading.Lock()   # only one VIA call at a time
 
-        # Core state
-        self.poses:      Dict[FrameIdx, Pose]           = {}
-        self.landmarks:  Dict[int, np.ndarray]          = {}    # lm_id → X (3,)
-        self.observations: Dict[int, List[Obs]]         = {}    # lm_id → obs list
+    # ── FAST PATH — every camera frame ────────────────────────────────────
 
-        # Map feature_id (from database) → landmark_id (our internal id)
-        # They start as the same but landmarks can outlive features.
-        self._feat_to_lm: Dict[FeatId, int]  = {}
-        self._next_lm_id = 0
-
-        # Sliding window: ordered list of frame indices currently in the window
-        self._window: List[FrameIdx] = []
-
-        # Store undistorted points per frame for triangulation
-        # { frame_idx: { feat_id: (u_undist, v_undist) } }
-        self._undistorted: Dict[FrameIdx, Dict[FeatId, Tuple[float, float]]] = {}
-
-    # ------------------------------------------------------------------
-    # Main entry point — called from vo_pipeline.py every frame
-    # ------------------------------------------------------------------
-
-    def process_frame(
+    def compute_pose(
         self,
-        frame_idx: FrameIdx,
-        snapshot: Dict[FeatId, List[Obs]],   # from database.get_snapshot_for_estimator()
-    ) -> Optional[Pose]:
-        # Build per-frame undistorted observation lookup
-        self._update_undistorted_cache(frame_idx, snapshot)
+        R:         np.ndarray,   # (3,3) rotation from VO
+        t:         np.ndarray,   # (3,1) or (3,) translation in visual units
+        timestamp: float,
+    ) -> Pose:
+        """
+        Called directly from process_frame_mono() on every frame.
+        Must be fast — no heavy computation here.
+        """
+        t = np.array(t, dtype=np.float64).flatten()
+        R = np.array(R, dtype=np.float64)
 
-        if not self.is_initialized:
-            return self._try_initialize(frame_idx, snapshot)
+        scale        = self._state.scale
+        scale_status = 'unscaled'
+
+        # Apply metric scale
+        if scale is not None and scale > 0:
+            t_metric     = scale * t
+            scale_status = 'scaled'
         else:
-            return self._track_frame(frame_idx, snapshot)
+            t_metric = t.copy()   # visual units — consistent but not metric
 
-    # ------------------------------------------------------------------
-    # Initialization — two-frame Essential matrix bootstrap
-    # ------------------------------------------------------------------
+        # Apply pending BA correction (consumes it — fires once per BA run)
+        ba_corr: Optional[BACorrection] = self._state.consume_ba_correction()
+        if ba_corr is not None and ba_corr.valid:
+            t_metric     = ba_corr.delta_R @ t_metric + ba_corr.delta_t
+            R            = ba_corr.delta_R @ R
+            scale_status = 'ba_fused'
 
-    def _try_initialize(
+        qx, qy, qz, qw = _rot_to_quat(R)
+
+        return Pose(
+            x=float(t_metric[0]),
+            y=float(t_metric[1]),
+            z=float(t_metric[2]),
+            qx=qx, qy=qy, qz=qz, qw=qw,
+            timestamp=timestamp,
+            scale_status=scale_status,
+        )
+
+    # ── SLOW PATH — keyframe alignment ────────────────────────────────────
+
+    def on_new_keyframe(
         self,
-        curr_frame_idx: FrameIdx,
-        snapshot: Dict[FeatId, List[Obs]],
-    ) -> Optional[Pose]:
+        keyframe_poses: List[dict],
+        timestamp:      float,
+    ) -> None:
         """
-        Try to initialize from Frame 0 and the current frame.
-        Succeeds when median parallax exceeds threshold and enough inliers.
+        Called by vo_pipeline after triangulation succeeds on a new keyframe.
+
+        keyframe_poses: list of dicts from keyframe_selector.get_all_keyframes()
+            Must contain: frame_idx (int), timestamp (float),
+                          R (3,3 ndarray), and 't' or 'p_bar' (3,) ndarray.
         """
-        # Find features observed in both frame 0 and current frame.
-        # Frame 0 is the first frame that ever appeared in the snapshot.
-        ref_frame_idx = self._get_reference_frame_idx(snapshot)
-        if ref_frame_idx is None or ref_frame_idx == curr_frame_idx:
-            return None
+        # Save pre-BA snapshot before normalising
+        self._update_pre_ba_snapshot(keyframe_poses)
 
-        pts_ref, pts_curr, common_feat_ids = self._get_common_observations(
-            snapshot, ref_frame_idx, curr_frame_idx
-        )
+        normalised = self._normalise_kf_list(keyframe_poses)
+        self._state.update_keyframe_poses(normalised)
 
-        if len(pts_ref) < 8:
-            return None
+        self._kf_since_last_via += 1
+        n_kf = len(normalised)
 
-        # Check parallax
-        parallax = self._median_parallax(pts_ref, pts_curr)
-        if parallax < self.min_init_parallax_px:
-            return None  # not enough motion yet — keep waiting
+        if n_kf < self._min_kf:
+            if self._verbose:
+                print(f"[MotionEstimator] {n_kf}/{self._min_kf} KFs — "
+                      "waiting for more before alignment.")
+            return
 
-        # Undistort both sets
-        pts_ref_u  = self._undistort_points(pts_ref)
-        pts_curr_u = self._undistort_points(pts_curr)
+        first_time   = not self._state.alignment_valid
+        periodic_run = (self._realign_every > 0 and
+                        self._kf_since_last_via >= self._realign_every)
 
-        # Essential matrix with RANSAC
-        E, inlier_mask = cv2.findEssentialMat(
-            pts_ref_u, pts_curr_u,
-            self.K,
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=1.0,
-        )
+        if first_time or periodic_run:
+            self._kf_since_last_via = 0
+            # Run VIA in a background thread so camera callback never blocks
+            self._run_via_async(normalised)
 
-        if E is None:
-            return None
+    # ── CORRECTION PATH — after BA ────────────────────────────────────────
 
-        inliers = inlier_mask.ravel().astype(bool)
-        if inliers.sum() < self.min_init_inliers:
-            return None
-
-        # Recover relative pose
-        _, R01, t01, pose_mask = cv2.recoverPose(
-            E,
-            pts_ref_u[inliers],
-            pts_curr_u[inliers],
-            self.K,
-        )
-        # t01 is unit length — scale is arbitrary
-
-        # Store Frame 0 and Frame 1 poses
-        R0 = np.eye(3,    dtype=np.float64)
-        t0 = np.zeros((3, 1), dtype=np.float64)
-        self.poses[ref_frame_idx]  = (R0,  t0)
-        self.poses[curr_frame_idx] = (R01, t01)
-        self._window = [ref_frame_idx, curr_frame_idx]
-
-        # Triangulate initial landmarks
-        inlier_feat_ids = [common_feat_ids[i] for i in range(len(common_feat_ids)) if inliers[i]]
-        pts_ref_in  = pts_ref_u[inliers]
-        pts_curr_in = pts_curr_u[inliers]
-
-        self._triangulate_and_store(
-            ref_frame_idx,  R0,  t0,  pts_ref_in,
-            curr_frame_idx, R01, t01, pts_curr_in,
-            inlier_feat_ids,
-            snapshot,
-        )
-
-        self.is_initialized = True
-        print(f"[Estimator] Initialized: frames {ref_frame_idx}↔{curr_frame_idx}, "
-              f"parallax={parallax:.1f}px, "
-              f"inliers={inliers.sum()}, "
-              f"landmarks={len(self.landmarks)}")
-
-        return self.poses[curr_frame_idx]
-
-    # ------------------------------------------------------------------
-    # Per-frame tracking — PnP + new landmark triangulation
-    # ------------------------------------------------------------------
-
-    def _track_frame(
+    def on_ba_updated(
         self,
-        curr_frame_idx: FrameIdx,
-        snapshot: Dict[FeatId, List[Obs]],
-    ) -> Optional[Pose]:
+        ba_keyframe_poses: List[dict],
+        map_points:        List[np.ndarray],
+        timestamp:         float,
+    ) -> None:
         """
-        Estimate pose of curr_frame_idx via PnP against known landmarks,
-        then triangulate any new landmarks visible from this frame.
+        Called by vo_pipeline after bundle adjustment completes.
+        Computes the pose correction delta and stores it in VIOState.
         """
-        # --- Step 1: collect 3D-2D correspondences for PnP ---
-        pts3d = []
-        pts2d = []
-        lm_ids_used = []
+        if not ba_keyframe_poses:
+            return
 
-        for feat_id, obs_list in snapshot.items():
-            # Check if this feature has a known 3D landmark
-            lm_id = self._feat_to_lm.get(feat_id)
-            if lm_id is None or lm_id not in self.landmarks:
-                continue
+        normalised = self._normalise_kf_list(ba_keyframe_poses)
+        self._state.update_keyframe_poses(normalised)
+        self._state.update_map_points(map_points)
 
-            # Find the observation in the current frame
-            curr_obs = self._get_obs_in_frame(obs_list, curr_frame_idx)
-            if curr_obs is None:
-                continue
+        delta_R, delta_t, ref_idx = self._compute_ba_delta(normalised)
+        if delta_R is not None:
+            self._state.update_ba_correction(delta_R, delta_t, ref_idx)
+            if self._verbose:
+                print(f"[MotionEstimator] BA correction stored: "
+                      f"|Δt|={np.linalg.norm(delta_t):.4f} m  ref_kf={ref_idx}")
 
-            pts3d.append(self.landmarks[lm_id])
-            pts2d.append([curr_obs[1], curr_obs[2]])
-            lm_ids_used.append(lm_id)
+        # Refresh pre-BA snapshot to post-BA values for next BA run
+        self._update_pre_ba_snapshot(normalised)
 
-        if len(pts3d) < 6:
-            print(f"[Estimator] Frame {curr_frame_idx}: only {len(pts3d)} 3D-2D matches, skipping PnP")
-            return None
+        # Re-run VIA with BA-corrected poses for better scale estimate
+        n_kf = len(normalised)
+        if n_kf >= self._min_kf:
+            self._run_via_async(normalised)
 
-        pts3d = np.array(pts3d, dtype=np.float64)
-        pts2d = np.array(pts2d, dtype=np.float64)
+    # ── VIA execution ─────────────────────────────────────────────────────
 
-        # --- Step 2: solvePnPRansac ---
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            pts3d, pts2d,
-            self.K, self.dist_coeffs,
-            iterationsCount=200,
-            reprojectionError=4.0,
-            confidence=0.999,
-            flags=cv2.SOLVEPNP_ITERATIVE,
+    def _run_via_async(self, kf_poses: List[dict]) -> None:
+        """Spawn background thread so camera callback is never blocked."""
+        t = threading.Thread(
+            target=self._run_via,
+            args=(kf_poses,),
+            daemon=True,
+            name='VIA-alignment',
         )
+        t.start()
 
-        if not success or inliers is None or len(inliers) < self.min_pnp_inliers:
-            print(f"[Estimator] Frame {curr_frame_idx}: PnP failed "
-                  f"(success={success}, inliers={len(inliers) if inliers is not None else 0})")
-            return None
+    def _run_via(self, kf_poses: List[dict]) -> None:
+        """
+        Build (p_bar, R) pose list and kf_timestamps, then call
+        via.run_between() which fetches chunk.raw_samples per pair
+        and runs the full alignment pipeline.
+        """
+        if not self._via_lock.acquire(blocking=False):
+            if self._verbose:
+                print("[MotionEstimator] VIA already running — skipping.")
+            return
 
-        R_curr, _ = cv2.Rodrigues(rvec)
-        t_curr    = tvec  # (3,1)
+        try:
+            # Build the (p_bar, R) list VIA.run() expects
+            via_poses = [(kf['p_bar'], kf['R']) for kf in kf_poses]
 
-        self.poses[curr_frame_idx] = (R_curr, t_curr)
-        self._window.append(curr_frame_idx)
+            # Timestamps for each keyframe — used by run_between() to look
+            # up the correct IMU chunk in chunk_db
+            kf_timestamps = [kf['timestamp'] for kf in kf_poses]
 
-        # --- Step 3: triangulate new landmarks ---
-        # Use the previous frame in the window as the reference for triangulation.
-        # Using the immediately prior frame maximises baseline for new features.
-        if len(self._window) >= 2:
-            ref_frame_idx = self._window[-2]
-            R_ref, t_ref  = self.poses[ref_frame_idx]
-            self._triangulate_new_features(
-                ref_frame_idx, R_ref, t_ref,
-                curr_frame_idx, R_curr, t_curr,
-                snapshot,
+            if self._verbose:
+                print(f"[MotionEstimator] Running VIA: "
+                      f"{len(via_poses)} KFs  "
+                      f"t=[{kf_timestamps[0]:.2f} … {kf_timestamps[-1]:.2f}]")
+
+            # VIA fetches chunk.raw_samples for each pair, calls
+            # preintegrate() on real data, then runs full alignment
+            s, g_world, velocities_list = self._via.run_between(
+                via_poses, kf_timestamps
             )
 
-        # --- Step 4: slide the window ---
-        self._slide_window()
+            # Map velocities to frame_idx
+            vel_dict = {
+                kf_poses[i]['frame_idx']: velocities_list[i]
+                for i in range(len(kf_poses))
+            }
 
-        n_lm = len(self.landmarks)
-        print(f"[Estimator] Frame {curr_frame_idx}: PnP inliers={len(inliers)}, landmarks={n_lm}")
+            self._state.update_alignment(s, g_world, vel_dict)
 
-        return self.poses[curr_frame_idx]
+            if self._verbose:
+                print(f"[MotionEstimator] VIA SUCCESS  "
+                      f"scale={s:.4f}  |g|={np.linalg.norm(g_world):.3f} m/s²")
 
-    # ------------------------------------------------------------------
-    # Triangulation
-    # ------------------------------------------------------------------
+        except (AssertionError, RuntimeError, np.linalg.LinAlgError) as e:
+            if self._verbose:
+                print(f"[MotionEstimator] VIA failed: {e}")
 
-    def _triangulate_and_store(
+        finally:
+            self._via_lock.release()
+
+    # ── Pre-BA snapshot ───────────────────────────────────────────────────
+
+    def _update_pre_ba_snapshot(self, kf_poses: List[dict]) -> None:
+        """Save current visual poses so we can compute BA correction delta."""
+        self._pre_ba_poses = {
+            kf['frame_idx']: (
+                np.array(kf.get('p_bar', kf.get('t', np.zeros(3))),
+                         dtype=np.float64).flatten(),
+                np.array(kf['R'], dtype=np.float64),
+            )
+            for kf in kf_poses
+        }
+
+    def _compute_ba_delta(
         self,
-        frame_a_idx: FrameIdx, Ra: np.ndarray, ta: np.ndarray, pts_a: np.ndarray,
-        frame_b_idx: FrameIdx, Rb: np.ndarray, tb: np.ndarray, pts_b: np.ndarray,
-        feat_ids: List[FeatId],
-        snapshot: Dict[FeatId, List[Obs]],
-    ):
+        ba_poses: List[dict],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
         """
-        Triangulate a batch of point correspondences and store them as landmarks.
-        pts_a, pts_b are (N,2) undistorted normalized or pixel coords.
+        Compute (delta_R, delta_t, ref_frame_idx) from the most recently
+        updated keyframe that exists in both pre-BA and post-BA snapshots.
+
+        Satisfies:
+            post_R = delta_R @ pre_R
+            post_t = delta_R @ pre_t + delta_t   (metric units)
         """
-        Pa = self.K @ np.hstack([Ra, ta])   # (3,4)
-        Pb = self.K @ np.hstack([Rb, tb])   # (3,4)
+        if not self._pre_ba_poses or not ba_poses:
+            return None, None, -1
 
-        pts_a_T = pts_a.T.astype(np.float32)  # (2, N)
-        pts_b_T = pts_b.T.astype(np.float32)
+        scale = self._state.scale
 
-        pts4d = cv2.triangulatePoints(Pa.astype(np.float32),
-                                       Pb.astype(np.float32),
-                                       pts_a_T, pts_b_T)  # (4, N)
-
-        # Convert homogeneous → 3D, filter invalid points
-        w = pts4d[3, :]
-        valid = np.abs(w) > 1e-6
-        pts3d = (pts4d[:3, :] / w[np.newaxis, :]).T  # (N, 3)
-
-        for i, feat_id in enumerate(feat_ids):
-            if not valid[i]:
+        for kf in reversed(ba_poses):
+            idx = kf['frame_idx']
+            if idx not in self._pre_ba_poses:
                 continue
 
-            X = pts3d[i]
+            pre_p, pre_R   = self._pre_ba_poses[idx]
+            post_p = kf['p_bar']
+            post_R = kf['R']
 
-            # Cheirality: point must be in front of both cameras
-            X_a = Ra @ X + ta.ravel()
-            X_b = Rb @ X + tb.ravel()
-            if X_a[2] <= 0 or X_b[2] <= 0:
-                continue
+            delta_R = post_R @ pre_R.T
+            delta_t = post_p - delta_R @ pre_p
 
-            lm_id = self._next_lm_id
-            self._next_lm_id += 1
+            # Convert translation delta to metric
+            if scale is not None and scale > 0:
+                delta_t = scale * delta_t
 
-            self.landmarks[lm_id]     = X
-            self._feat_to_lm[feat_id] = lm_id
+            return delta_R, delta_t, idx
 
-            # Store all available observations for this landmark
-            if feat_id in snapshot:
-                self.observations[lm_id] = list(snapshot[feat_id])
+        return None, None, -1
 
-    def _triangulate_new_features(
-        self,
-        frame_a_idx: FrameIdx, Ra: np.ndarray, ta: np.ndarray,
-        frame_b_idx: FrameIdx, Rb: np.ndarray, tb: np.ndarray,
-        snapshot: Dict[FeatId, List[Obs]],
-    ):
-        """
-        Find features visible in both frame_a and frame_b but not yet
-        triangulated, and triangulate them.
-        """
-        pts_a_list, pts_b_list, feat_ids = [], [], []
-
-        for feat_id, obs_list in snapshot.items():
-            if feat_id in self._feat_to_lm:
-                continue  # already has a landmark
-
-            obs_a = self._get_obs_in_frame(obs_list, frame_a_idx)
-            obs_b = self._get_obs_in_frame(obs_list, frame_b_idx)
-            if obs_a is None or obs_b is None:
-                continue
-
-            pts_a_list.append([obs_a[1], obs_a[2]])
-            pts_b_list.append([obs_b[1], obs_b[2]])
-            feat_ids.append(feat_id)
-
-        if len(feat_ids) == 0:
-            return
-
-        pts_a = self._undistort_points(np.array(pts_a_list, dtype=np.float32))
-        pts_b = self._undistort_points(np.array(pts_b_list, dtype=np.float32))
-
-        self._triangulate_and_store(
-            frame_a_idx, Ra, ta, pts_a,
-            frame_b_idx, Rb, tb, pts_b,
-            feat_ids, snapshot,
-        )
-
-    # ------------------------------------------------------------------
-    # Sliding window management
-    # ------------------------------------------------------------------
-
-    def _slide_window(self):
-        """
-        Drop the oldest frame if window exceeds size limit.
-        Landmarks only observed in the dropped frame are removed.
-        """
-        while len(self._window) > self.window_size:
-            dropped_frame = self._window.pop(0)
-            self.poses.pop(dropped_frame, None)
-            self._undistorted.pop(dropped_frame, None)
-
-            # Remove landmarks with no observations in remaining window frames
-            remaining_frames = set(self._window)
-            lm_ids_to_drop = []
-
-            for lm_id, obs_list in self.observations.items():
-                still_observed = any(o[0] in remaining_frames for o in obs_list)
-                if not still_observed:
-                    lm_ids_to_drop.append(lm_id)
-
-            for lm_id in lm_ids_to_drop:
-                self.landmarks.pop(lm_id, None)
-                self.observations.pop(lm_id, None)
-
-    # ------------------------------------------------------------------
-    # Helper utilities
-    # ------------------------------------------------------------------
-
-    def _get_reference_frame_idx(self, snapshot) -> Optional[FrameIdx]:
-        """Return the oldest frame index seen across all observations."""
-        oldest = None
-        for obs_list in snapshot.values():
-            for (fidx, u, v) in obs_list:
-                if oldest is None or fidx < oldest:
-                    oldest = fidx
-        return oldest
-
-    def _get_common_observations(
-        self,
-        snapshot: Dict[FeatId, List[Obs]],
-        frame_a: FrameIdx,
-        frame_b: FrameIdx,
-    ) -> Tuple[np.ndarray, np.ndarray, List[FeatId]]:
-        """
-        Return (pts_a, pts_b, feat_ids) for features observed in both frames.
-        """
-        pts_a, pts_b, feat_ids = [], [], []
-
-        for feat_id, obs_list in snapshot.items():
-            obs_a = self._get_obs_in_frame(obs_list, frame_a)
-            obs_b = self._get_obs_in_frame(obs_list, frame_b)
-            if obs_a is None or obs_b is None:
-                continue
-            pts_a.append([obs_a[1], obs_a[2]])
-            pts_b.append([obs_b[1], obs_b[2]])
-            feat_ids.append(feat_id)
-
-        return (np.array(pts_a, dtype=np.float32),
-                np.array(pts_b, dtype=np.float32),
-                feat_ids)
+    # ── Utilities ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _get_obs_in_frame(
-        obs_list: List[Obs],
-        frame_idx: FrameIdx,
-    ) -> Optional[Obs]:
-        """Find the observation tuple for a specific frame index."""
-        for obs in obs_list:
-            if obs[0] == frame_idx:
-                return obs
-        return None
-
-    def _undistort_points(self, pts: np.ndarray) -> np.ndarray:
+    def _normalise_kf_list(kf_list: List[dict]) -> List[dict]:
         """
-        Undistort (N,2) pixel points using camera intrinsics and distortion.
-        Returns (N,2) undistorted pixel coordinates.
+        Ensure every keyframe dict has a 'p_bar' key (some code uses 't').
+        Returns a new list with standardised keys.
         """
-        if len(pts) == 0:
-            return pts
-        pts_reshaped = pts.reshape(-1, 1, 2).astype(np.float64)
-        undist = cv2.undistortPoints(pts_reshaped, self.K, self.dist_coeffs, P=self.K)
-        return undist.reshape(-1, 2).astype(np.float64)
+        out = []
+        for kf in kf_list:
+            entry = dict(kf)
+            if 'p_bar' not in entry:
+                t = entry.get('t', np.zeros(3))
+                entry['p_bar'] = np.array(t, dtype=np.float64).flatten()
+            else:
+                entry['p_bar'] = np.array(entry['p_bar'], dtype=np.float64).flatten()
+            entry['R'] = np.array(entry['R'], dtype=np.float64)
+            out.append(entry)
+        return out
 
-    def _update_undistorted_cache(
-        self,
-        frame_idx: FrameIdx,
-        snapshot: Dict[FeatId, List[Obs]],
-    ):
-        """Cache undistorted coordinates for the current frame's observations."""
-        if frame_idx in self._undistorted:
-            return
-        frame_obs = {}
-        for feat_id, obs_list in snapshot.items():
-            obs = self._get_obs_in_frame(obs_list, frame_idx)
-            if obs is not None:
-                pts_u = self._undistort_points(
-                    np.array([[obs[1], obs[2]]], dtype=np.float32)
-                )
-                frame_obs[feat_id] = (pts_u[0, 0], pts_u[0, 1])
-        self._undistorted[frame_idx] = frame_obs
+    # ── Debug ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _median_parallax(pts_a: np.ndarray, pts_b: np.ndarray) -> float:
-        """Median pixel displacement between two point sets."""
-        if len(pts_a) == 0:
-            return 0.0
-        return float(np.median(np.linalg.norm(pts_b - pts_a, axis=1)))
-
-    # ------------------------------------------------------------------
-    # Query interface for IMU scale estimator
-    # ------------------------------------------------------------------
-
-    def get_visual_poses(self) -> Dict[FrameIdx, Pose]:
-        """
-        Return all poses in the current sliding window.
-        { frame_idx: (R, t) } — t is up-to-scale.
-        Feed these into solve_scale_gravity_velocity().
-        """
-        return {k: self.poses[k] for k in self._window if k in self.poses}
-
-    def get_landmarks(self) -> Dict[int, np.ndarray]:
-        return dict(self.landmarks)
+    def status(self) -> dict:
+        return {
+            'alignment_valid' : self._state.alignment_valid,
+            'alignment_count' : self._state.alignment_count,
+            'scale'           : self._state.scale,
+            'kf_since_via'    : self._kf_since_last_via,
+            'ba_pending'      : self._state.peek_ba_correction() is not None,
+            'pre_ba_kfs'      : len(self._pre_ba_poses),
+        }

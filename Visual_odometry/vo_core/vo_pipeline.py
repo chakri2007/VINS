@@ -14,10 +14,18 @@ from motion_estimation.pnp_estimator import PnPEstimator
 from feature_database.landmark_map import LandmarkMap
 from motion_estimation.bundle_adjustment.bundle_adjustment import BundleAdjustment
 
+from motion_estimation.motion_estimation import MotionEstimator, Pose
+
 
 class VisualOdometryPipeline:
 
-    def __init__(self, calibration_data, mode="mono", frame_size=(640, 480)):
+    def __init__(
+        self,
+        calibration_data,
+        motion_estimator: Optional[MotionEstimator] = None,
+        mode: str = "mono",
+        frame_size: Tuple[int, int] = (640, 480),
+    ):
         self.mode       = mode
         self.frame_size = frame_size
         self.is_initialized = False
@@ -84,7 +92,7 @@ class VisualOdometryPipeline:
 
         self._current_R     = np.eye(3,    dtype=np.float64)
         self._current_t     = np.zeros((3, 1), dtype=np.float64)
-        self._pose_from_pnp = False   # diagnostic flag
+        self._pose_from_pnp = False
 
         self._estimation_queue = Queue(maxsize=2)
         self._result_queue     = Queue(maxsize=8)
@@ -99,11 +107,39 @@ class VisualOdometryPipeline:
         self.gridder_max_per_cell = (
             self.extractor.gridder.min_features_per_cell * 2
         )
-        self._frame_idx = 0
+        self._frame_idx   = 0
         self._pose_history = {}
 
+        # ── VIO wiring ────────────────────────────────────────────────
+        # Set via set_motion_estimator() or pass directly to __init__
+        self._motion_estimator: Optional[MotionEstimator] = motion_estimator
 
-    def process_frame_mono(self, cv_frame: np.ndarray, timestamp: float):
+        # Callback called by _drain_result_queue when a new keyframe fires.
+        # Signature: (imu_pipeline, timestamp) — set by vo_subscriber
+        self._on_keyframe_cb = None
+
+    # ── Public wiring API ─────────────────────────────────────────────────
+
+    def set_motion_estimator(self, me: MotionEstimator) -> None:
+        self._motion_estimator = me
+
+    def set_keyframe_callback(self, cb) -> None:
+        """
+        Register a callback called immediately when a new keyframe is
+        accepted.  Used by vo_subscriber to forward the timestamp to the
+        IMU pipeline.
+        Signature: cb(timestamp: float)
+        """
+        self._on_keyframe_cb = cb
+
+    # ── Main entry point ──────────────────────────────────────────────────
+
+    def process_frame_mono(
+        self,
+        cv_frame: np.ndarray,
+        timestamp: float,
+    ) -> Optional[dict]:
+
         gray_frame = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
 
         if not self.is_initialized:
@@ -133,12 +169,10 @@ class VisualOdometryPipeline:
         self.database.purge_tracks(lost_ids)
         self.landmark_map.prune_feat_ids(lost_ids)
 
-
         self._update_phase()
         if self._phase == 'tracking':
             self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
         else:
-            #update this to use current computed pose
             self._current_R     = self.keyframe_selector._world_R.copy()
             self._current_t     = self.keyframe_selector._world_t.copy()
             self._pose_from_pnp = False
@@ -181,6 +215,15 @@ class VisualOdometryPipeline:
         self.database.set_reference_frame(gray_frame)
         tracks = self.database.get_active_feature_histories()
 
+        # ── Compute final metric pose (every frame) ───────────────────
+        pose: Optional[Pose] = None
+        if self._motion_estimator is not None:
+            pose = self._motion_estimator.compute_pose(
+                R=self._current_R,
+                t=self._current_t,
+                timestamp=timestamp,
+            )
+
         return {
             'frame_idx'       : self._frame_idx,
             'timestamp'       : timestamp,
@@ -191,17 +234,19 @@ class VisualOdometryPipeline:
             'pose_from_pnp'   : self._pose_from_pnp,
             'R'               : self._current_R.copy(),
             't'               : self._current_t.copy(),
+            'pose'            : pose,        # ← Pose dataclass or None
             'landmark_summary': self.landmark_map.summary(),
             'tracks'          : tracks,
             'K'               : self.K,
             'D'               : self.distortion_coeffs,
         }
 
+    # ── Pose estimation ───────────────────────────────────────────────────
 
     def _estimate_pose_pnp(
         self,
-        tracked_ids: np.ndarray,       # (N,)   feature IDs tracked this frame
-        tracked_curr_pts: np.ndarray,  # (N, 2) their pixel positions
+        tracked_ids: np.ndarray,
+        tracked_curr_pts: np.ndarray,
     ):
         pts3d_list = []
         pts2d_list = []
@@ -244,6 +289,8 @@ class VisualOdometryPipeline:
                 print(f"[Pipeline] bootstrap → tracking "
                       f"({self.landmark_map.num_landmarks()} landmarks)")
 
+    # ── Background estimation thread ──────────────────────────────────────
+
     def _estimation_loop(self):
         while True:
             snapshot = self._estimation_queue.get()
@@ -273,6 +320,7 @@ class VisualOdometryPipeline:
 
             ransac_result = packet['ransac_result']
             frame_idx     = packet['frame_idx']
+            timestamp     = packet['timestamp']
 
             if ransac_result is not None:
                 outlier_ids = ransac_result.get('outlier_ids', np.array([]))
@@ -286,6 +334,14 @@ class VisualOdometryPipeline:
 
             if is_kf:
                 print(f"[Pipeline] New keyframe: frame {frame_idx}")
+
+                # # ── Notify IMU pipeline to cut a chunk here ────────────
+
+                #I DONT WANT TO MAKE INTEGRATION CHUNCKS ON KEYFRAMES ONLY - I WANT TO MAKE THE CHUNK ON EVERY FRAME.
+
+                # if self._on_keyframe_cb is not None:
+                #     self._on_keyframe_cb(timestamp)
+
                 pair = self.keyframe_selector.get_last_two_keyframes()
 
                 if pair is not None:
@@ -306,6 +362,14 @@ class VisualOdometryPipeline:
                               f"{len(tri_result['landmarks'])} landmarks. "
                               f"Total: {self.landmark_map.num_landmarks()}")
 
+                        # ── Notify motion estimator after triangulation ──
+                        if self._motion_estimator is not None:
+                            all_kfs = self.keyframe_selector.get_all_keyframes()
+                            self._motion_estimator.on_new_keyframe(
+                                keyframe_poses=all_kfs,
+                                timestamp=timestamp,
+                            )
+
                     self._update_phase()
 
                 active_frames = [
@@ -325,6 +389,17 @@ class VisualOdometryPipeline:
                     if ran:
                         print("[Pipeline] BA completed.")
 
+                        # ── Notify motion estimator of BA update ────────
+                        if self._motion_estimator is not None:
+                            ba_kfs     = self.keyframe_selector.get_all_keyframes()
+                            ba_pts     = list(self.landmark_map.landmarks.values())
+                            self._motion_estimator.on_ba_updated(
+                                ba_keyframe_poses=ba_kfs,
+                                map_points=ba_pts,
+                                timestamp=timestamp,
+                            )
+
+    # ── Misc ──────────────────────────────────────────────────────────────
 
     def _register_new_observations(self, kf: dict):
         for feat_id, pt in zip(kf['feat_ids'], kf['pts']):
@@ -349,7 +424,6 @@ class VisualOdometryPipeline:
         self.database.initialize_ledger(initial_corners, gray_frame, timestamp)
         self.is_initialized = True
         print(f"[Pipeline] Initialized at timestamp={timestamp:.3f}")
-
 
     def get_current_pose(self) -> Tuple[np.ndarray, np.ndarray]:
         return self._current_R.copy(), self._current_t.copy()
