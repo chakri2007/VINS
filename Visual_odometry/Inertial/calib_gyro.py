@@ -1,3 +1,7 @@
+import numpy as np
+from typing import List, Tuple
+from Inertial.preintegrate import quat_mult, quat_inv
+
 def calibrate_gyro_bias(visual_quats, preint_gammas, J_gamma_bws):
     A = np.zeros((3*len(preint_gammas), 3))
     b = np.zeros( 3*len(preint_gammas))

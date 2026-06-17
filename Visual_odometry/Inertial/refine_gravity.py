@@ -1,3 +1,7 @@
+import numpy as np
+from typing import List, Tuple
+
+
 def refine_gravity(g_c0_init, visual_poses, alphas, betas, 
                    dts, p_bc, velocities, n_iter=4):
     G_MAGNITUDE = 9.81
