@@ -164,7 +164,10 @@ class VisualInertialAlignment:
         # ── Step 1: Fresh preintegration over each full KF interval ──────
         preint_results = []
         for segment in imu_segments:
-            result = preintegrate(segment, self.b_a, self.b_w)
+            result = preintegrate(segment, self.b_a, self.b_w, 
+                        sigma_a=self.noise.get('sigma_a', 0.02),
+                      sigma_w=self.noise.get('sigma_w', 0.005),
+                      )
             preint_results.append(result)
 
         alphas      = [r[0] for r in preint_results]

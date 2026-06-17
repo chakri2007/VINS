@@ -17,10 +17,14 @@ def quat_to_rot(q: np.ndarray) -> np.ndarray:
         [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x**2 + y**2)]
     ])
     return R
-def preintegrate(imu_data, b_a, b_w):
+def preintegrate(imu_data, b_a, b_w, sigma_a=0.02, sigma_w=0.005):
     alpha = np.zeros(3)
     beta  = np.zeros(3)
     gamma = np.array([1., 0., 0., 0.])  # quaternion [w,x,y,z]
+
+    Q = np.zeros((6, 6))
+    Q[0:3, 0:3] = np.eye(3) * sigma_a**2    # accelerometer noise
+    Q[3:6, 3:6] = np.eye(3) * sigma_w**2    # gyroscope noise
     
     # Jacobians wrt bias (for bias correction later)
     J_alpha_ba = np.zeros((3,3))
