@@ -336,6 +336,8 @@ class VisualOdometryPipeline:
                 if pair is not None:
                     kf_prev, kf_curr = pair
 
+                    kf_curr['timestamp'] = timestamp
+
                     if self._phase == 'tracking':
                         kf_frame_idx = kf_curr['frame_idx']
                         if kf_frame_idx in self._pose_history:
