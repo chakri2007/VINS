@@ -160,9 +160,21 @@ py::dict solve_bundle_adjustment(
     // transform applied to everything gives the same cost).
     // Fixing the first pose anchors the coordinate frame.
     if (fix_first && !poses.empty()) {
-        problem.SetParameterBlockConstant(poses[0].data());       // rvec
-        problem.SetParameterBlockConstant(poses[0].data() + 3);  // tvec
+        if (problem.HasParameterBlock(poses[0].data())) {
+            problem.SetParameterBlockConstant(poses[0].data());
+            problem.SetParameterBlockConstant(poses[0].data() + 3);
+        } else {
+            // First camera has no observations — fix the next one that does
+            for (int i = 0; i < (int)poses.size(); ++i) {
+                if (problem.HasParameterBlock(poses[i].data())) {
+                    problem.SetParameterBlockConstant(poses[i].data());
+                    problem.SetParameterBlockConstant(poses[i].data() + 3);
+                    break;
+                }
+            }
+        }
     }
+    
 
     // ── Configure and run solver ───────────────────────────────────────────
     ceres::Solver::Options options;

@@ -8,6 +8,7 @@ from cv_bridge import CvBridge
 import os, sys
 
 from vo_visualizer import VOFeatureVisualizer
+from vo_publisher import VOPosePublisher
 
 current_dir  = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
@@ -69,10 +70,8 @@ class VisualOdometryNode(Node):
             self.imu_pipeline.notify_frame
         )
 
-        self.visualizer = VOFeatureVisualizer()
-
-        # External pose callback registered by vo_publisher
-        self._external_pose_callback = None
+        self.visualizer     = VOFeatureVisualizer()
+        self.pose_publisher = VOPosePublisher()
 
         # ── Camera subscriber ─────────────────────────────────────────────
         if self.mode == "mono":
@@ -133,10 +132,9 @@ class VisualOdometryNode(Node):
         if result is None:
             return
 
-        # Forward pose to vo_publisher via registered callback
-        if (self._external_pose_callback is not None
-                and result.get('pose') is not None):
-            self._external_pose_callback(result['pose'], msg.header.stamp)
+        # Forward pose to vo_publisher — same direct-call pattern as visualizer
+        if result.get('pose') is not None:
+            self.pose_publisher.publish(result['pose'], msg.header.stamp)
 
         self.visualizer.publish_feature_tracks(
             cv_image, timestamp, result['tracks'], result['K'], result['D']
@@ -144,10 +142,6 @@ class VisualOdometryNode(Node):
 
     def stereo_image_callback(self, left_msg: Image, right_msg: Image):
         pass
-
-    def register_pose_output_callback(self, cb):
-        """Called by vo_publisher to receive Pose objects."""
-        self._external_pose_callback = cb
 
     # ── Config helpers ────────────────────────────────────────────────────
 
