@@ -17,13 +17,13 @@ Fix applied [Issue 6]:
 import numpy as np
 from typing import List, Tuple, Optional
 
-from Visual_odometry.Inertial.imu_chunk_db import IMUChunkDatabase
-from Visual_odometry.Inertial.calib_gyro import calibrate_gyro_bias
-from Visual_odometry.Inertial.preintegrate import preintegrate
-from Visual_odometry.Inertial.optimize_scale_gravity_velocity import (
+from Inertial.imu_chunk_db import IMUChunkDatabase
+from Inertial.calib_gyro import calibrate_gyro_bias
+from Inertial.preintegrate import preintegrate
+from Inertial.optimize_scale_gravity_velocity import (
     solve_scale_gravity_velocity,
 )
-from Visual_odometry.Inertial.refine_gravity import refine_gravity
+from Inertial.refine_gravity import refine_gravity
 
 
 def pose_to_quat(R: np.ndarray) -> np.ndarray:

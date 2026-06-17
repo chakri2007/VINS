@@ -19,9 +19,9 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
-from Visual_odometry.vo_core.vo_state import VIOState, BACorrection
-from Visual_odometry.Inertial.imu_chunk_db import IMUChunkDatabase
-from Visual_odometry.Inertial.visual_inertial_alignment import VisualInertialAlignment
+from vo_core.vo_state import VIOState, BACorrection
+from Inertial.imu_chunk_db import IMUChunkDatabase
+from Inertial.visual_inertial_alignment import VisualInertialAlignment
 
 
 # ── Output type ───────────────────────────────────────────────────────────────

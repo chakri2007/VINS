@@ -1,3 +1,22 @@
+import numpy as np
+
+def skew(v: np.ndarray) -> np.ndarray:
+    """Skew-symmetric matrix for cross product."""
+    return np.array([
+        [0,   -v[2],  v[1]],
+        [v[2],  0,   -v[0]],
+        [-v[1], v[0],  0 ]
+    ])
+
+def quat_to_rot(q: np.ndarray) -> np.ndarray:
+    """Convert quaternion [w, x, y, z] to rotation matrix."""
+    w, x, y, z = q
+    R = np.array([
+        [1 - 2*(y**2 + z**2),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x**2 + z**2),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x**2 + y**2)]
+    ])
+    return R
 def preintegrate(imu_data, b_a, b_w):
     alpha = np.zeros(3)
     beta  = np.zeros(3)

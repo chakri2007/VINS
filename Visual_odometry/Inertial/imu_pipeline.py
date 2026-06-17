@@ -32,7 +32,7 @@ from collections import deque
 from typing import Optional, List, Tuple
 import time
 
-from Visual_odometry.Inertial.imu_chunk_db import IMUChunkDatabase, IMUChunk
+from Inertial.imu_chunk_db import IMUChunkDatabase, IMUChunk
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
