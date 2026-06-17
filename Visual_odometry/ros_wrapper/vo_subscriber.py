@@ -96,7 +96,7 @@ class VisualOdometryNode(Node):
             self.get_logger().info("Subscribed to synchronized stereo topics.")
 
         # ── IMU subscriber ────────────────────────────────────────────────
-        imu_topic = self.ros_config.get('imu_topic', '/imu/data')
+        imu_topic = self.ros_config.get('imu_topic', '/imu/imu/data')
         self.imu_sub = self.create_subscription(
             Imu,
             imu_topic,
