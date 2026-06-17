@@ -32,6 +32,7 @@ class KeyframeSelector:
         self,
         frame_idx: int,
         ransac_result: Optional[dict],
+        timestamp: float = 0.0,
     ) -> bool:
 
         self._frame_counter += 1
@@ -105,6 +106,7 @@ class KeyframeSelector:
 
         record = {
             'frame_idx': frame_idx,
+            'timestamp': timestamp,
             'R': new_R.copy(),
             't': new_t.copy(),
             'pts': pts_b.copy(),

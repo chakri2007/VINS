@@ -326,6 +326,7 @@ class VisualOdometryPipeline:
             is_kf = self.keyframe_selector.process(
                 frame_idx=frame_idx,
                 ransac_result=ransac_result,
+                timestamp=timestamp,
             )
 
             if is_kf:
@@ -335,8 +336,6 @@ class VisualOdometryPipeline:
 
                 if pair is not None:
                     kf_prev, kf_curr = pair
-
-                    kf_curr['timestamp'] = timestamp
 
                     if self._phase == 'tracking':
                         kf_frame_idx = kf_curr['frame_idx']
