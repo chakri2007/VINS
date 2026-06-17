@@ -1,3 +1,6 @@
+import numpy as np
+from typing import List, Tuple
+
 def solve_scale_gravity_velocity(
     visual_poses,    # list of (p_bar_c0_bk, R_c0_bk) — up-to-scale
     alphas,          # preintegrated alpha for each pair
