@@ -30,7 +30,7 @@ class VisualOdometryPipeline:
         self.frame_size = frame_size
         self.is_initialized = False
 
-        # ── Calibration ───────────────────────────────────────────────
+        # ── Calibration ───────────────────────────────────────────────────
         self.left_calib        = calibration_data['left']
         self.intrinsics        = self.left_calib['intrinsics']
         self.distortion_coeffs = np.array(
@@ -49,7 +49,7 @@ class VisualOdometryPipeline:
         self.extractor = FeatureExtractor(
             method="FAST+KLT", frame_size=frame_size
         )
-        self.database = FeatureDatabase()
+        self.database  = FeatureDatabase()
 
         self.ransac = RANSACMotionEstimator(
             K=self.K,
@@ -63,10 +63,7 @@ class VisualOdometryPipeline:
             min_inliers      = 20,
         )
 
-        self.triangulator = Triangulator(
-            K=self.K,
-            min_angle_deg=1.0,
-        )
+        self.triangulator = Triangulator(K=self.K, min_angle_deg=1.0)
 
         self.pnp = PnPEstimator(
             K=self.K,
@@ -90,7 +87,7 @@ class VisualOdometryPipeline:
         self._phase = 'bootstrap'
         self._min_landmarks_for_pnp = 20
 
-        self._current_R     = np.eye(3,    dtype=np.float64)
+        self._current_R     = np.eye(3, dtype=np.float64)
         self._current_t     = np.zeros((3, 1), dtype=np.float64)
         self._pose_from_pnp = False
 
@@ -98,8 +95,7 @@ class VisualOdometryPipeline:
         self._result_queue     = Queue(maxsize=8)
 
         self._estimator_thread = Thread(
-            target=self._estimation_loop,
-            daemon=True,
+            target=self._estimation_loop, daemon=True,
         )
         self._estimator_thread.start()
 
@@ -107,30 +103,36 @@ class VisualOdometryPipeline:
         self.gridder_max_per_cell = (
             self.extractor.gridder.min_features_per_cell * 2
         )
-        self._frame_idx   = 0
+        self._frame_idx    = 0
         self._pose_history = {}
 
-        # ── VIO wiring ────────────────────────────────────────────────
-        # Set via set_motion_estimator() or pass directly to __init__
+        # ── VIO wiring ────────────────────────────────────────────────────
         self._motion_estimator: Optional[MotionEstimator] = motion_estimator
 
-        # Callback called by _drain_result_queue when a new keyframe fires.
-        # Signature: (imu_pipeline, timestamp) — set by vo_subscriber
-        self._on_keyframe_cb = None
+        # [Fix Issues 4 & 5]
+        # set_frame_callback() registers a callback fired on EVERY camera
+        # frame so the IMU pipeline cuts a chunk per frame (not per keyframe)
+        self._on_frame_cb = None
 
     # ── Public wiring API ─────────────────────────────────────────────────
 
     def set_motion_estimator(self, me: MotionEstimator) -> None:
         self._motion_estimator = me
 
+    def set_frame_callback(self, cb) -> None:
+        """
+        [Fix Issue 4] Renamed from set_keyframe_callback → set_frame_callback
+        to match vo_subscriber.py.
+
+        cb(timestamp: float) is called on EVERY camera frame so the IMU
+        pipeline cuts one chunk per frame interval.
+        [Fix Issue 5] Callback is now wired and fires every frame.
+        """
+        self._on_frame_cb = cb
+
+    # kept for backwards compatibility
     def set_keyframe_callback(self, cb) -> None:
-        """
-        Register a callback called immediately when a new keyframe is
-        accepted.  Used by vo_subscriber to forward the timestamp to the
-        IMU pipeline.
-        Signature: cb(timestamp: float)
-        """
-        self._on_keyframe_cb = cb
+        self.set_frame_callback(cb)
 
     # ── Main entry point ──────────────────────────────────────────────────
 
@@ -148,6 +150,11 @@ class VisualOdometryPipeline:
 
         self._frame_idx += 1
         self._drain_result_queue()
+
+        # [Fix Issue 5] — notify IMU pipeline EVERY frame so chunks are cut
+        # at frame rate, not just at keyframe rate
+        if self._on_frame_cb is not None:
+            self._on_frame_cb(timestamp)
 
         prev_frame, prev_points, prev_ids = self.database.get_active_tracks()
 
@@ -176,6 +183,15 @@ class VisualOdometryPipeline:
             self._current_R     = self.keyframe_selector._world_R.copy()
             self._current_t     = self.keyframe_selector._world_t.copy()
             self._pose_from_pnp = False
+
+        # ── Compute metric pose every frame (fast path) ───────────────────
+        pose: Optional[Pose] = None
+        if self._motion_estimator is not None:
+            pose = self._motion_estimator.compute_pose(
+                R=self._current_R,
+                t=self._current_t,
+                timestamp=timestamp,
+            )
 
         snapshot = self._build_snapshot(timestamp)
         if not self._estimation_queue.full():
@@ -215,15 +231,6 @@ class VisualOdometryPipeline:
         self.database.set_reference_frame(gray_frame)
         tracks = self.database.get_active_feature_histories()
 
-        # ── Compute final metric pose (every frame) ───────────────────
-        pose: Optional[Pose] = None
-        if self._motion_estimator is not None:
-            pose = self._motion_estimator.compute_pose(
-                R=self._current_R,
-                t=self._current_t,
-                timestamp=timestamp,
-            )
-
         return {
             'frame_idx'       : self._frame_idx,
             'timestamp'       : timestamp,
@@ -234,7 +241,7 @@ class VisualOdometryPipeline:
             'pose_from_pnp'   : self._pose_from_pnp,
             'R'               : self._current_R.copy(),
             't'               : self._current_t.copy(),
-            'pose'            : pose,        # ← Pose dataclass or None
+            'pose'            : pose,        # Pose dataclass or None
             'landmark_summary': self.landmark_map.summary(),
             'tracks'          : tracks,
             'K'               : self.K,
@@ -243,19 +250,12 @@ class VisualOdometryPipeline:
 
     # ── Pose estimation ───────────────────────────────────────────────────
 
-    def _estimate_pose_pnp(
-        self,
-        tracked_ids: np.ndarray,
-        tracked_curr_pts: np.ndarray,
-    ):
-        pts3d_list = []
-        pts2d_list = []
+    def _estimate_pose_pnp(self, tracked_ids, tracked_curr_pts):
+        pts3d_list, pts2d_list = [], []
 
         for feat_id, pt2d in zip(tracked_ids, tracked_curr_pts):
             lm_id = self.landmark_map.feat_to_lm.get(int(feat_id))
-            if lm_id is None:
-                continue
-            if lm_id not in self.landmark_map.landmarks:
+            if lm_id is None or lm_id not in self.landmark_map.landmarks:
                 continue
             pts3d_list.append(self.landmark_map.landmarks[lm_id])
             pts2d_list.append(pt2d)
@@ -264,9 +264,8 @@ class VisualOdometryPipeline:
             self._pose_from_pnp = False
             return
 
-        pts3d = np.array(pts3d_list, dtype=np.float64)
-        pts2d = np.array(pts2d_list, dtype=np.float64)
-
+        pts3d  = np.array(pts3d_list, dtype=np.float64)
+        pts2d  = np.array(pts2d_list, dtype=np.float64)
         result = self.pnp.estimate(pts3d=pts3d, pts2d=pts2d)
 
         if result is None:
@@ -275,7 +274,7 @@ class VisualOdometryPipeline:
                   f"({len(pts3d)} candidates) — keeping last pose")
             return
 
-        R, t, inlier_mask = result
+        R, t, inlier_mask   = result
         self._current_R     = R
         self._current_t     = t
         self._pose_from_pnp = True
@@ -296,18 +295,15 @@ class VisualOdometryPipeline:
             snapshot = self._estimation_queue.get()
             if snapshot is None:
                 break
-
             histories     = snapshot['histories']
             frame_idx     = snapshot['frame_idx']
             timestamp     = snapshot['timestamp']
             ransac_result = self.ransac.estimate(histories)
-
             result_packet = {
                 'frame_idx'    : frame_idx,
                 'timestamp'    : timestamp,
                 'ransac_result': ransac_result,
             }
-
             if not self._result_queue.full():
                 self._result_queue.put_nowait(result_packet)
 
@@ -335,13 +331,6 @@ class VisualOdometryPipeline:
             if is_kf:
                 print(f"[Pipeline] New keyframe: frame {frame_idx}")
 
-                # # ── Notify IMU pipeline to cut a chunk here ────────────
-
-                #I DONT WANT TO MAKE INTEGRATION CHUNCKS ON KEYFRAMES ONLY - I WANT TO MAKE THE CHUNK ON EVERY FRAME.
-
-                # if self._on_keyframe_cb is not None:
-                #     self._on_keyframe_cb(timestamp)
-
                 pair = self.keyframe_selector.get_last_two_keyframes()
 
                 if pair is not None:
@@ -362,7 +351,7 @@ class VisualOdometryPipeline:
                               f"{len(tri_result['landmarks'])} landmarks. "
                               f"Total: {self.landmark_map.num_landmarks()}")
 
-                        # ── Notify motion estimator after triangulation ──
+                        # ── Notify motion estimator (slow path / VIA) ─────
                         if self._motion_estimator is not None:
                             all_kfs = self.keyframe_selector.get_all_keyframes()
                             self._motion_estimator.on_new_keyframe(
@@ -388,11 +377,9 @@ class VisualOdometryPipeline:
                     )
                     if ran:
                         print("[Pipeline] BA completed.")
-
-                        # ── Notify motion estimator of BA update ────────
                         if self._motion_estimator is not None:
-                            ba_kfs     = self.keyframe_selector.get_all_keyframes()
-                            ba_pts     = list(self.landmark_map.landmarks.values())
+                            ba_kfs = self.keyframe_selector.get_all_keyframes()
+                            ba_pts = list(self.landmark_map.landmarks.values())
                             self._motion_estimator.on_ba_updated(
                                 ba_keyframe_poses=ba_kfs,
                                 map_points=ba_pts,
