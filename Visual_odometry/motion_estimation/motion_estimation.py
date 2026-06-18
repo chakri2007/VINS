@@ -102,22 +102,24 @@ class MotionEstimator:
         t = np.array(t, dtype=np.float64).flatten()
         R = np.array(R, dtype=np.float64)
 
-        scale        = self._state.scale
-        scale_status = 'unscaled'
+        R_wc = R.T
+        C_world = -R_wc @ t
 
+        scale = self._state.scale
+        scale_status = 'unscaled'
         if scale is not None and scale > 0:
-            t_metric     = scale * t
+            t_metric = scale * C_world
             scale_status = 'scaled'
         else:
-            t_metric = t.copy()
+            t_metric = C_world.copy()
 
-        ba_corr: Optional[BACorrection] = self._state.consume_ba_correction()
+        ba_corr = self._state.consume_ba_correction()
         if ba_corr is not None and ba_corr.valid:
-            t_metric     = ba_corr.delta_R @ t_metric + ba_corr.delta_t
-            R            = ba_corr.delta_R @ R
+            t_metric = ba_corr.delta_R @ t_metric + ba_corr.delta_t
+            R_wc     = ba_corr.delta_R @ R_wc
             scale_status = 'ba_fused'
 
-        qx, qy, qz, qw = _rot_to_quat(R)
+        qx, qy, qz, qw = _rot_to_quat(R_wc)
 
         return Pose(
             x=float(t_metric[0]), y=float(t_metric[1]), z=float(t_metric[2]),
@@ -251,16 +253,16 @@ class MotionEstimator:
     # ── Utilities ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _normalise_kf_list(kf_list: List[dict]) -> List[dict]:
+    def _normalise_kf_list(kf_list):
         out = []
         for kf in kf_list:
             entry = dict(kf)
-            if 'p_bar' not in entry:
-                t = entry.get('t', np.zeros(3))
-                entry['p_bar'] = np.array(t, dtype=np.float64).flatten()
-            else:
-                entry['p_bar'] = np.array(entry['p_bar'], dtype=np.float64).flatten()
-            entry['R'] = np.array(entry['R'], dtype=np.float64)
+            R_cw = np.array(entry['R'], dtype=np.float64)
+            t_cw = np.array(entry.get('p_bar', entry.get('t', np.zeros(3))),
+                            dtype=np.float64).flatten()
+            R_wc = R_cw.T
+            entry['R']     = R_wc
+            entry['p_bar'] = -R_wc @ t_cw
             out.append(entry)
         return out
 
