@@ -1,2 +1,0 @@
-evo_traj tum 100_2.txt vio.txt -p -a
-

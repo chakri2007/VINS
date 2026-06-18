@@ -36,7 +36,7 @@ class Pose:
     qz: float
     qw: float
     timestamp:    float
-    scale_status: str   # 'unscaled' | 'scaled' | 'ba_fused'
+    scale_status: str   # 'unscaled' | 'scaled' | 'ba_fused' | 'stereo_metric'
 
 
 # ── Quaternion helper ─────────────────────────────────────────────────────────

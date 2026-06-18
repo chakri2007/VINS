@@ -1,4 +1,4 @@
-vo_mode: "mono"
+vo_mode: "stereo"   # "mono" | "stereo"
 
 left_camera_topic: "/left/downsample_raw"
 right_camera_topic: "/camera/right/image_raw"    # Ignored if vo_mode is "mono"

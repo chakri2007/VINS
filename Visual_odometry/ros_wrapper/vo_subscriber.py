@@ -141,7 +141,20 @@ class VisualOdometryNode(Node):
         )
 
     def stereo_image_callback(self, left_msg: Image, right_msg: Image):
-        pass
+        timestamp = left_msg.header.stamp.sec + left_msg.header.stamp.nanosec * 1e-9
+        cv_left   = self.bridge.imgmsg_to_cv2(left_msg,  desired_encoding='bgr8')
+        cv_right  = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='bgr8')
+
+        result = self.vo_pipeline.process_frame_stereo(cv_left, cv_right, timestamp)
+        if result is None:
+            return
+
+        if result.get('pose') is not None:
+            self.pose_publisher.publish(result['pose'], left_msg.header.stamp)
+
+        self.visualizer.publish_feature_tracks(
+            cv_left, timestamp, result['tracks'], result['K'], result['D']
+        )
 
     # ── Config helpers ────────────────────────────────────────────────────
 

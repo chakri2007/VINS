@@ -15,6 +15,8 @@ from feature_database.landmark_map import LandmarkMap
 from motion_estimation.bundle_adjustment.bundle_adjustment import BundleAdjustment
 
 from motion_estimation.motion_estimation import MotionEstimator, Pose
+from motion_estimation.stereo_rectifier import StereoRectifier
+from motion_estimation.stereo_triangulator import StereoTriangulator
 
 
 class VisualOdometryPipeline:
@@ -108,6 +110,34 @@ class VisualOdometryPipeline:
 
         # ── VIO wiring ────────────────────────────────────────────────────
         self._motion_estimator: Optional[MotionEstimator] = motion_estimator
+
+        # ── Stereo-specific components (built only in stereo mode) ─────────
+        self._rectifier:         Optional[StereoRectifier]      = None
+        self._stereo_triangulator: Optional[StereoTriangulator] = None
+
+        if self.mode == 'stereo':
+            if 'right' not in calibration_data:
+                raise ValueError(
+                    "[Pipeline] stereo mode requires calibration_data['right']. "
+                    "Pass right_camera.yaml in load_calibration_files()."
+                )
+            self._rectifier = StereoRectifier(
+                calib_left  = calibration_data['left'],
+                calib_right = calibration_data['right'],
+            )
+            # Use the rectified left intrinsics for triangulation so that
+            # pixel coordinates after rectification match K_rect.
+            self._stereo_triangulator = StereoTriangulator(
+                K             = self._rectifier.K_rect,
+                baseline      = self._rectifier.baseline,
+                block_size    = 11,
+                min_disparity = 1.0,
+                max_disparity = 128.0,
+                ncc_threshold = 0.7,
+                epipolar_band = 2,
+                min_landmarks = 5,
+            )
+            print(f"[Pipeline] Stereo mode: baseline={self._rectifier.baseline*100:.1f} cm")
 
         # [Fix Issues 4 & 5]
         # set_frame_callback() registers a callback fired on EVERY camera
@@ -348,12 +378,16 @@ class VisualOdometryPipeline:
                     if tri_result is not None:
                         self.landmark_map.add_triangulation_result(tri_result)
                         self._register_new_observations(kf_curr)
-                        print(f"[Pipeline] Triangulated "
-                              f"{len(tri_result['landmarks'])} landmarks. "
-                              f"Total: {self.landmark_map.num_landmarks()}")
+                        print(
+                            f"[Pipeline] Triangulated "
+                            f"{len(tri_result['landmarks'])} landmarks. "
+                            f"Total: {self.landmark_map.num_landmarks()}"
+                        )
 
                         # ── Notify motion estimator (slow path / VIA) ─────
-                        if self._motion_estimator is not None:
+                        # Skipped in stereo mode: scale is already metric
+                        # from the stereo pair — VIA alignment not needed.
+                        if self._motion_estimator is not None and self.mode != 'stereo':
                             all_kfs = self.keyframe_selector.get_all_keyframes()
                             self._motion_estimator.on_new_keyframe(
                                 keyframe_poses=all_kfs,
@@ -425,8 +459,176 @@ class VisualOdometryPipeline:
     def get_keyframe_poses(self):
         return self.keyframe_selector.get_all_keyframes()
 
-    def process_frame_stereo(self, cv_frame_left, cv_frame_right, timestamp):
-        pass
+    def process_frame_stereo(
+        self,
+        cv_frame_left:  np.ndarray,
+        cv_frame_right: np.ndarray,
+        timestamp:      float,
+    ) -> Optional[dict]:
+        """
+        Stereo VO frame processing.
+
+        Key differences from mono
+        ─────────────────────────
+        • Both frames are rectified before any processing.
+        • On EVERY frame, StereoTriangulator produces metric 3-D landmarks
+          from the current stereo pair — no temporal triangulation needed for
+          bootstrap.  The temporal Triangulator is still called at keyframes
+          to add landmarks for features that were tracked but not matched by
+          stereo on this frame.
+        • Bootstrap collapses to a single frame: once stereo triangulation
+          yields ≥ _min_landmarks_for_pnp points the pipeline goes straight
+          to 'tracking'.
+        • PnP uses the rectified left intrinsics (K_rect from the rectifier).
+        • Scale is metric from day one; MotionEstimator passes through with
+          scale_status='stereo_metric' (scale=None path, no VIA needed).
+        • The async RANSAC background thread and result-drain logic are
+          identical to mono — only the triangulation source changes.
+        """
+        # ── Convert + rectify ─────────────────────────────────────────────
+        gray_left  = cv2.cvtColor(cv_frame_left,  cv2.COLOR_BGR2GRAY)
+        gray_right = cv2.cvtColor(cv_frame_right, cv2.COLOR_BGR2GRAY)
+
+        rect_left, rect_right = self._rectifier.rectify(gray_left, gray_right)
+
+        # ── Initialization (first frame) ──────────────────────────────────
+        if not self.is_initialized:
+            self._handle_initialization(rect_left, timestamp)
+            return None
+
+        self._frame_idx += 1
+        self._drain_result_queue()
+
+        if self._on_frame_cb is not None:
+            self._on_frame_cb(timestamp)
+
+        # ── KLT tracking on the rectified left frame ───────────────────────
+        prev_frame, prev_points, prev_ids = self.database.get_active_tracks()
+
+        curr_points, status = self.extractor.track_features(
+            prev_frame=prev_frame,
+            curr_frame=rect_left,
+            prev_points=prev_points,
+        )
+
+        valid_indices = np.where(status == 1)[0]
+        lost_indices  = np.where(status == 0)[0]
+
+        tracked_ids      = prev_ids[valid_indices]
+        tracked_curr_pts = curr_points[valid_indices]
+        lost_ids         = prev_ids[lost_indices]
+
+        self.database.update_active_positions(tracked_ids, tracked_curr_pts)
+        self.database.purge_tracks(lost_ids)
+        self.landmark_map.prune_feat_ids(lost_ids)
+
+        # ── Stereo triangulation on every frame ───────────────────────────
+        # Produces metric landmarks immediately — no temporal accumulation
+        # needed. New landmarks are merged into the shared LandmarkMap so
+        # PnP can use them from the very next frame.
+        if len(tracked_ids) > 0:
+            stereo_result = self._stereo_triangulator.triangulate(
+                rect_left   = rect_left,
+                rect_right  = rect_right,
+                left_points = tracked_curr_pts,
+                feat_ids    = tracked_ids,
+                frame_idx   = self._frame_idx,
+            )
+            if stereo_result is not None:
+                self.landmark_map.add_triangulation_result(stereo_result)
+                # Register left-frame observations for the new landmarks
+                for feat_id, pt in zip(tracked_ids, tracked_curr_pts):
+                    lm_id = stereo_result['feat_to_lm'].get(int(feat_id))
+                    if lm_id is not None:
+                        self.landmark_map.add_observation(
+                            lm_id=lm_id,
+                            frame_idx=self._frame_idx,
+                            u=float(pt[0]),
+                            v=float(pt[1]),
+                        )
+                print(
+                    f"[Stereo] Frame {self._frame_idx}: "
+                    f"stereo-triangulated {len(stereo_result['landmarks'])} landmarks. "
+                    f"Map total: {self.landmark_map.num_landmarks()}"
+                )
+
+        # ── Phase update + PnP ────────────────────────────────────────────
+        self._update_phase()
+        if self._phase == 'tracking':
+            self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
+        else:
+            self._current_R     = self.keyframe_selector._world_R.copy()
+            self._current_t     = self.keyframe_selector._world_t.copy()
+            self._pose_from_pnp = False
+
+        # ── Metric pose (fast path) ───────────────────────────────────────
+        pose: Optional[Pose] = None
+        if self._motion_estimator is not None:
+            pose = self._motion_estimator.compute_pose(
+                R=self._current_R,
+                t=self._current_t,
+                timestamp=timestamp,
+            )
+            # Override scale_status to reflect that stereo is already metric
+            if pose is not None:
+                object.__setattr__(pose, 'scale_status', 'stereo_metric')
+
+        # ── Push snapshot to async RANSAC thread ──────────────────────────
+        snapshot = self._build_snapshot(timestamp)
+        if not self._estimation_queue.full():
+            self._estimation_queue.put_nowait(snapshot)
+
+        # ── Grid management: evict overcrowded cells, fill empty ones ─────
+        evict_ids = self.extractor.gridder.get_overcrowded_evictions(
+            tracked_points=tracked_curr_pts,
+            track_ids=tracked_ids,
+            track_ages=self.database.ages[
+                np.isin(self.database.ids, tracked_ids)
+            ],
+            max_features_per_cell=self.gridder_max_per_cell,
+        )
+        if len(evict_ids) > 0:
+            self.database.purge_tracks(evict_ids)
+            self.landmark_map.prune_feat_ids(evict_ids)
+            keep_mask        = ~np.isin(tracked_ids, evict_ids)
+            tracked_curr_pts = tracked_curr_pts[keep_mask]
+            tracked_ids      = tracked_ids[keep_mask]
+
+        new_grid_points = self.extractor.extract_features_in_empty_cells(
+            gray_frame=rect_left,
+            tracked_points=tracked_curr_pts,
+        )
+        if len(new_grid_points) > 0:
+            self.database.add_new_tracks(new_grid_points, rect_left)
+
+        total_tracked = len(tracked_ids) + len(new_grid_points)
+        if total_tracked < self._global_track_min:
+            all_pts  = self.database.get_active_positions()
+            fallback = self.extractor.detect_new_features(
+                rect_left, existing_points=all_pts
+            )
+            if len(fallback) > 0:
+                self.database.add_new_tracks(fallback, rect_left)
+
+        self.database.set_reference_frame(rect_left)
+        tracks = self.database.get_active_feature_histories()
+
+        return {
+            'frame_idx'       : self._frame_idx,
+            'timestamp'       : timestamp,
+            'n_tracked'       : total_tracked,
+            'n_landmarks'     : self.landmark_map.num_landmarks(),
+            'n_keyframes'     : self.keyframe_selector.num_keyframes(),
+            'phase'           : self._phase,
+            'pose_from_pnp'   : self._pose_from_pnp,
+            'R'               : self._current_R.copy(),
+            't'               : self._current_t.copy(),
+            'pose'            : pose,
+            'landmark_summary': self.landmark_map.summary(),
+            'tracks'          : tracks,
+            'K'               : self._rectifier.K_rect,   # rectified K for visualiser
+            'D'               : np.zeros(4),               # already undistorted
+        }
 
     def shutdown(self):
         self._estimation_queue.put(None)
