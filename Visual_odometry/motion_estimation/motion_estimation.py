@@ -132,8 +132,8 @@ class MotionEstimator:
 
     def on_new_keyframe(self, keyframe_poses: List[dict],
                         timestamp: float) -> None:
-        self._update_pre_ba_snapshot(keyframe_poses)
         normalised = self._normalise_kf_list(keyframe_poses)
+        self._update_pre_ba_snapshot(normalised)
         self._state.update_keyframe_poses(normalised)
 
         self._kf_since_last_via += 1
