@@ -361,9 +361,9 @@ class IMUPipeline:
         )
         self._db.store(chunk)
 
-        print(f"[IMUPipeline] Chunk [{self._chunk_t_start:.3f}→{t_end:.3f}]  "
-              f"dt={chunk.dt_total:.3f}s  n_raw={chunk.n_samples()}  "
-              f"total={self._db.get_chunk_count()}")
+        # print(f"[IMUPipeline] Chunk [{self._chunk_t_start:.3f}→{t_end:.3f}]  "
+        #       f"dt={chunk.dt_total:.3f}s  n_raw={chunk.n_samples()}  "
+        #       f"total={self._db.get_chunk_count()}")
 
         self._chunk_t_start       = t_end
         self._current_raw_samples = []

@@ -91,6 +91,9 @@ class VisualOdometryPipeline:
         self._current_t     = np.zeros((3, 1), dtype=np.float64)
         self._pose_from_pnp = False
 
+        self._last_valid_R = np.eye(3, dtype=np.float64)
+        self._last_valid_t = np.zeros((3, 1), dtype=np.float64)
+
         self._estimation_queue = Queue(maxsize=2)
         self._result_queue     = Queue(maxsize=8)
 
@@ -180,9 +183,20 @@ class VisualOdometryPipeline:
         if self._phase == 'tracking':
             self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
         else:
-            self._current_R     = self.keyframe_selector._world_R.copy()
-            self._current_t     = self.keyframe_selector._world_t.copy()
+            # Bootstrap: use keyframe selector (but ensure continuity)
+            if hasattr(self.keyframe_selector, '_world_R') and self.keyframe_selector._world_R is not None:
+                self._current_R = self.keyframe_selector._world_R.copy()
+                self._current_t = self.keyframe_selector._world_t.copy()
             self._pose_from_pnp = False
+
+        # NEW: Fallback propagation on failure (prevents freezing)
+        if not self._pose_from_pnp and hasattr(self, '_last_valid_R'):
+            # Simple constant velocity / hold last good pose (better than freeze)
+            self._current_R = self._last_valid_R.copy()
+            self._current_t = self._last_valid_t.copy()
+        elif self._pose_from_pnp:
+            self._last_valid_R = self._current_R.copy()
+            self._last_valid_t = self._current_t.copy()
 
         # ── Compute metric pose every frame (fast path) ───────────────────
         pose: Optional[Pose] = None
