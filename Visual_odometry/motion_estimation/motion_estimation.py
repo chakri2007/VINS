@@ -274,10 +274,10 @@ class MotionEstimator:
         [BUGFIX] entry['R'] / entry['p_bar' or 't'] come from PnP/RANSAC and
         are WORLD -> CAMERA (x_cam = R_raw @ X_world + t_raw), the same
         convention compute_pose() already assumes (it does R_wc = R.T).
-        This function previously used R_raw directly as if it were already
-        camera -> world, skipping the transpose. That silently fed a wrong
-        rotation/position into VIA -- the root cause of the chronic
-        "Scale must be positive" / "Gravity magnitude unreasonable"
+        This function was previously using R_raw directly as if it were
+        already camera -> world, skipping the transpose. That silently fed
+        a wrong rotation/position into VIA, which is the root cause of the
+        chronic "Scale must be positive" / "Gravity magnitude unreasonable"
         failures and the near-zero, frozen output trajectory.
 
         Fix: transpose first to get the true camera -> world rotation
