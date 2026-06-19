@@ -112,9 +112,6 @@ class VisualOdometryPipeline:
         # ── VIO wiring ────────────────────────────────────────────────────
         self._motion_estimator: Optional[MotionEstimator] = motion_estimator
 
-        # [Fix Issues 4 & 5]
-        # set_frame_callback() registers a callback fired on EVERY camera
-        # frame so the IMU pipeline cuts a chunk per frame (not per keyframe)
         self._on_frame_cb = None
 
     # ── Public wiring API ─────────────────────────────────────────────────
@@ -123,17 +120,8 @@ class VisualOdometryPipeline:
         self._motion_estimator = me
 
     def set_frame_callback(self, cb) -> None:
-        """
-        [Fix Issue 4] Renamed from set_keyframe_callback → set_frame_callback
-        to match vo_subscriber.py.
-
-        cb(timestamp: float) is called on EVERY camera frame so the IMU
-        pipeline cuts one chunk per frame interval.
-        [Fix Issue 5] Callback is now wired and fires every frame.
-        """
         self._on_frame_cb = cb
 
-    # kept for backwards compatibility
     def set_keyframe_callback(self, cb) -> None:
         self.set_frame_callback(cb)
 
@@ -154,8 +142,6 @@ class VisualOdometryPipeline:
         self._frame_idx += 1
         self._drain_result_queue()
 
-        # [Fix Issue 5] — notify IMU pipeline EVERY frame so chunks are cut
-        # at frame rate, not just at keyframe rate
         if self._on_frame_cb is not None:
             self._on_frame_cb(timestamp)
 
@@ -183,22 +169,24 @@ class VisualOdometryPipeline:
         if self._phase == 'tracking':
             self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
         else:
-            # Bootstrap: use keyframe selector (but ensure continuity)
+            # Bootstrap
             if hasattr(self.keyframe_selector, '_world_R') and self.keyframe_selector._world_R is not None:
                 self._current_R = self.keyframe_selector._world_R.copy()
                 self._current_t = self.keyframe_selector._world_t.copy()
             self._pose_from_pnp = False
 
-        # NEW: Fallback propagation on failure (prevents freezing)
-        if not self._pose_from_pnp and hasattr(self, '_last_valid_R'):
-            # Simple constant velocity / hold last good pose (better than freeze)
-            self._current_R = self._last_valid_R.copy()
-            self._current_t = self._last_valid_t.copy()
-        elif self._pose_from_pnp:
+        # === IMPROVED POSE FALLBACK ===
+        if not self._pose_from_pnp:
+            # Hold last valid pose when PnP fails
+            if hasattr(self, '_last_valid_R'):
+                self._current_R = self._last_valid_R.copy()
+                self._current_t = self._last_valid_t.copy()
+        else:
+            # Update last valid when PnP succeeds
             self._last_valid_R = self._current_R.copy()
             self._last_valid_t = self._current_t.copy()
 
-        # ── Compute metric pose every frame (fast path) ───────────────────
+        # ── Compute metric pose every frame ───────────────────────────────
         pose: Optional[Pose] = None
         if self._motion_estimator is not None:
             pose = self._motion_estimator.compute_pose(
@@ -211,6 +199,7 @@ class VisualOdometryPipeline:
         if not self._estimation_queue.full():
             self._estimation_queue.put_nowait(snapshot)
 
+        # Feature management
         evict_ids = self.extractor.gridder.get_overcrowded_evictions(
             tracked_points=tracked_curr_pts,
             track_ids=tracked_ids,
@@ -255,7 +244,7 @@ class VisualOdometryPipeline:
             'pose_from_pnp'   : self._pose_from_pnp,
             'R'               : self._current_R.copy(),
             't'               : self._current_t.copy(),
-            'pose'            : pose,        # Pose dataclass or None
+            'pose'            : pose,
             'landmark_summary': self.landmark_map.summary(),
             'tracks'          : tracks,
             'K'               : self.K,
@@ -284,16 +273,12 @@ class VisualOdometryPipeline:
 
         if result is None:
             self._pose_from_pnp = False
-            # print(f"[PnP] Failed frame {self._frame_idx} "
-            #       f"({len(pts3d)} candidates) — keeping last pose")
             return
 
         R, t, inlier_mask   = result
         self._current_R     = R
         self._current_t     = t
         self._pose_from_pnp = True
-        # print(f"[PnP] Frame {self._frame_idx}: "
-        #       f"{inlier_mask.sum()}/{len(pts3d)} inliers")
 
     def _update_phase(self):
         if self._phase == 'bootstrap':
@@ -344,8 +329,6 @@ class VisualOdometryPipeline:
             )
 
             if is_kf:
-                # print(f"[Pipeline] New keyframe: frame {frame_idx}")
-
                 pair = self.keyframe_selector.get_last_two_keyframes()
 
                 if pair is not None:
@@ -362,11 +345,7 @@ class VisualOdometryPipeline:
                     if tri_result is not None:
                         self.landmark_map.add_triangulation_result(tri_result)
                         self._register_new_observations(kf_curr)
-                        # print(f"[Pipeline] Triangulated "
-                        #       f"{len(tri_result['landmarks'])} landmarks. "
-                        #       f"Total: {self.landmark_map.num_landmarks()}")
 
-                        # ── Notify motion estimator (slow path / VIA) ─────
                         if self._motion_estimator is not None:
                             all_kfs = self.keyframe_selector.get_all_keyframes()
                             self._motion_estimator.on_new_keyframe(
