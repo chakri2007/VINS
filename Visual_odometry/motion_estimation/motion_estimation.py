@@ -132,7 +132,14 @@ class MotionEstimator:
 
     def on_new_keyframe(self, keyframe_poses: List[dict],
                         timestamp: float) -> None:
-        normalised = self._normalise_kf_list(keyframe_poses)
+        #normalised = self._normalise_kf_list(keyframe_poses)
+
+        normalised = self._normalise_kf_list(
+            keyframe_poses,
+            R_bc=self._via.R_bc,
+            p_bc=self._via.p_bc
+        )
+
         self._update_pre_ba_snapshot(normalised)
         self._state.update_keyframe_poses(normalised)
 
@@ -161,7 +168,14 @@ class MotionEstimator:
         if not ba_keyframe_poses:
             return
 
-        normalised = self._normalise_kf_list(ba_keyframe_poses)
+        #normalised = self._normalise_kf_list(ba_keyframe_poses)
+
+        normalised = self._normalise_kf_list(
+            ba_keyframe_poses,
+            R_bc=self._via.R_bc,
+            p_bc=self._via.p_bc
+        )
+        
         self._state.update_keyframe_poses(normalised)
         self._state.update_map_points(map_points)
 
@@ -252,17 +266,32 @@ class MotionEstimator:
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
+# 1. Replace the entire _normalise_kf_list method (around line 240-250)
     @staticmethod
-    def _normalise_kf_list(kf_list):
+    def _normalise_kf_list(kf_list, R_bc=None, p_bc=None):
+        """Convert camera-frame poses to BODY/IMU frame using extrinsic."""
         out = []
         for kf in kf_list:
             entry = dict(kf)
-            R_cw = np.array(entry['R'], dtype=np.float64)
+            
+            R_cw = np.array(entry['R'], dtype=np.float64)          # camera -> world
             t_cw = np.array(entry.get('p_bar', entry.get('t', np.zeros(3))),
-                            dtype=np.float64).flatten()
-            R_wc = R_cw.T
-            entry['R']     = R_wc
-            entry['p_bar'] = -R_wc @ t_cw
+                            dtype=np.float64).flatten().reshape(3, 1)
+            
+            # Camera center in world
+            C_world = -R_cw @ t_cw
+            
+            # === CRITICAL: Convert to BODY (IMU) frame ===
+            if R_bc is not None and p_bc is not None:
+                R_wb = R_cw @ R_bc.T
+                p_wb = (C_world - R_cw @ p_bc.reshape(3, 1)).flatten()
+            else:
+                # fallback (old incorrect behaviour)
+                R_wb = R_cw.T
+                p_wb = (-R_wb @ t_cw).flatten()
+            
+            entry['R']     = R_wb
+            entry['p_bar'] = p_wb
             out.append(entry)
         return out
 

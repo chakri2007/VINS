@@ -284,16 +284,16 @@ class VisualOdometryPipeline:
 
         if result is None:
             self._pose_from_pnp = False
-            print(f"[PnP] Failed frame {self._frame_idx} "
-                  f"({len(pts3d)} candidates) — keeping last pose")
+            # print(f"[PnP] Failed frame {self._frame_idx} "
+            #       f"({len(pts3d)} candidates) — keeping last pose")
             return
 
         R, t, inlier_mask   = result
         self._current_R     = R
         self._current_t     = t
         self._pose_from_pnp = True
-        print(f"[PnP] Frame {self._frame_idx}: "
-              f"{inlier_mask.sum()}/{len(pts3d)} inliers")
+        # print(f"[PnP] Frame {self._frame_idx}: "
+        #       f"{inlier_mask.sum()}/{len(pts3d)} inliers")
 
     def _update_phase(self):
         if self._phase == 'bootstrap':
@@ -344,7 +344,7 @@ class VisualOdometryPipeline:
             )
 
             if is_kf:
-                print(f"[Pipeline] New keyframe: frame {frame_idx}")
+                # print(f"[Pipeline] New keyframe: frame {frame_idx}")
 
                 pair = self.keyframe_selector.get_last_two_keyframes()
 
@@ -362,9 +362,9 @@ class VisualOdometryPipeline:
                     if tri_result is not None:
                         self.landmark_map.add_triangulation_result(tri_result)
                         self._register_new_observations(kf_curr)
-                        print(f"[Pipeline] Triangulated "
-                              f"{len(tri_result['landmarks'])} landmarks. "
-                              f"Total: {self.landmark_map.num_landmarks()}")
+                        # print(f"[Pipeline] Triangulated "
+                        #       f"{len(tri_result['landmarks'])} landmarks. "
+                        #       f"Total: {self.landmark_map.num_landmarks()}")
 
                         # ── Notify motion estimator (slow path / VIA) ─────
                         if self._motion_estimator is not None:
