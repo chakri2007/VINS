@@ -269,27 +269,44 @@ class MotionEstimator:
 # 1. Replace the entire _normalise_kf_list method (around line 240-250)
     @staticmethod
     def _normalise_kf_list(kf_list, R_bc=None, p_bc=None):
-        """Convert camera-frame poses to BODY/IMU frame using extrinsic."""
+        """Convert camera-frame poses to BODY/IMU frame using extrinsic.
+
+        [BUGFIX] entry['R'] / entry['p_bar' or 't'] come from PnP/RANSAC and
+        are WORLD -> CAMERA (x_cam = R_raw @ X_world + t_raw), the same
+        convention compute_pose() already assumes (it does R_wc = R.T).
+        This function previously used R_raw directly as if it were already
+        camera -> world, skipping the transpose. That silently fed a wrong
+        rotation/position into VIA -- the root cause of the chronic
+        "Scale must be positive" / "Gravity magnitude unreasonable"
+        failures and the near-zero, frozen output trajectory.
+
+        Fix: transpose first to get the true camera -> world rotation
+        (R_cw = R_raw.T), then compose with the camera->body extrinsic
+        exactly as before (that part was already algebraically correct).
+        """
         out = []
         for kf in kf_list:
             entry = dict(kf)
-            
-            R_cw = np.array(entry['R'], dtype=np.float64)          # camera -> world
-            t_cw = np.array(entry.get('p_bar', entry.get('t', np.zeros(3))),
+
+            R_raw = np.array(entry['R'], dtype=np.float64)         # world -> camera
+            t_raw = np.array(entry.get('p_bar', entry.get('t', np.zeros(3))),
                             dtype=np.float64).flatten().reshape(3, 1)
-            
+
+            # camera -> world rotation (this transpose was missing)
+            R_cw = R_raw.T
+
             # Camera center in world
-            C_world = -R_cw @ t_cw
-            
-            # === CRITICAL: Convert to BODY (IMU) frame ===
+            C_world = -R_cw @ t_raw
+
+            # === Convert to BODY (IMU) frame ===
             if R_bc is not None and p_bc is not None:
                 R_wb = R_cw @ R_bc.T
-                p_wb = (C_world - R_cw @ p_bc.reshape(3, 1)).flatten()
+                p_wb = (C_world - R_cw @ R_bc.T @ p_bc.reshape(3, 1)).flatten()
             else:
-                # fallback (old incorrect behaviour)
-                R_wb = R_cw.T
-                p_wb = (-R_wb @ t_cw).flatten()
-            
+                # fallback: body frame == camera frame (no extrinsic available)
+                R_wb = R_cw
+                p_wb = C_world.flatten()
+
             entry['R']     = R_wb
             entry['p_bar'] = p_wb
             out.append(entry)
