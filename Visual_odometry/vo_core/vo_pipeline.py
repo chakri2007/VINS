@@ -93,6 +93,10 @@ class VisualOdometryPipeline:
 
         self._last_valid_R = np.eye(3, dtype=np.float64)
         self._last_valid_t = np.zeros((3, 1), dtype=np.float64)
+        
+        # New: for smoother fallback propagation
+        self._prev_t = np.zeros((3, 1), dtype=np.float64)
+        self._last_velocity = np.zeros((3, 1), dtype=np.float64)
 
         self._estimation_queue = Queue(maxsize=2)
         self._result_queue     = Queue(maxsize=8)
@@ -169,20 +173,17 @@ class VisualOdometryPipeline:
         if self._phase == 'tracking':
             self._estimate_pose_pnp(tracked_ids, tracked_curr_pts)
         else:
-            # Bootstrap
             if hasattr(self.keyframe_selector, '_world_R') and self.keyframe_selector._world_R is not None:
                 self._current_R = self.keyframe_selector._world_R.copy()
                 self._current_t = self.keyframe_selector._world_t.copy()
             self._pose_from_pnp = False
 
-        # === IMPROVED POSE FALLBACK ===
+        # === IMPROVED POSE PROPAGATION ===
         if not self._pose_from_pnp:
-            # Hold last valid pose when PnP fails
             if hasattr(self, '_last_valid_R'):
                 self._current_R = self._last_valid_R.copy()
-                self._current_t = self._last_valid_t.copy()
+                self._current_t = self._last_valid_t.copy()   # hold last good pose
         else:
-            # Update last valid when PnP succeeds
             self._last_valid_R = self._current_R.copy()
             self._last_valid_t = self._current_t.copy()
 
@@ -199,7 +200,7 @@ class VisualOdometryPipeline:
         if not self._estimation_queue.full():
             self._estimation_queue.put_nowait(snapshot)
 
-        # Feature management
+        # Feature management (unchanged)
         evict_ids = self.extractor.gridder.get_overcrowded_evictions(
             tracked_points=tracked_curr_pts,
             track_ids=tracked_ids,

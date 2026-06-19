@@ -134,10 +134,10 @@ class VisualInertialAlignment:
 
             imu_segments.append(all_raw)
 
-            print(f"[VIA] Pair {i}: {len(chunks_sorted)} chunks  "
-                  f"total_raw={len(all_raw)}  "
-                  f"span=[{chunks_sorted[0].t_start:.3f}"
-                  f"→{chunks_sorted[-1].t_end:.3f}]")
+            # print(f"[VIA] Pair {i}: {len(chunks_sorted)} chunks  "
+            #       f"total_raw={len(all_raw)}  "
+            #       f"span=[{chunks_sorted[0].t_start:.3f}"
+            #       f"→{chunks_sorted[-1].t_end:.3f}]")
 
         # Hand off to core alignment — preintegrate() is called fresh
         # on the full concatenated raw sequence per keyframe pair
