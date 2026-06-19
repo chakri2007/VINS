@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -flto -shared  -o ba_solver.cpython-312-x86_64-linux-gnu.so CMakeFiles/ba_solver.dir/ba_solver.cpp.o  /usr/lib/x86_64-linux-gnu/libceres.so.2.2.0 /usr/lib/x86_64-linux-gnu/libglog.so.0.6.0 /usr/lib/x86_64-linux-gnu/libgflags.so.2.2.2 
