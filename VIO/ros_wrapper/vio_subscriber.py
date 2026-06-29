@@ -31,7 +31,7 @@ class VisualOdometryNode(Node):
         # ── Load config ──────────────────────────────────────────────
         config_path = self.declare_parameter(
             'config_path',
-            '/home/icgel/vio/VINS/Visual_odometry/config/ros_config.yaml',
+            '/home/icgel/vio/VINS/VIO/config/ros_config.yaml',
         ).get_parameter_value().string_value
 
         with open(config_path, 'r') as f:
