@@ -89,3 +89,56 @@ def find_pnp_correspondences(
     print("=========================================\n")
 
     return correspondences
+
+def solve_pnp(
+    correspondences,
+    K,
+):
+    """
+    Estimate camera pose from 3D-2D correspondences.
+
+    Returns
+    -------
+    PnPResult
+    """
+
+    if len(correspondences) < 6:
+        print("[PnP] Not enough correspondences.")
+        return None
+    
+    object_points = np.array(
+        [c.xyz for c in correspondences],
+        dtype=np.float64,
+    )
+
+    image_points = np.array(
+        [c.uv for c in correspondences],
+        dtype=np.float64,
+    )
+    print("\n========== PnP INPUT ==========")
+    print("Object points :", object_points.shape)
+    print("Image points  :", image_points.shape)
+    print("===============================\n")
+
+
+from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass
+class PnPResult:
+    """
+    Result returned by solvePnPRansac().
+    """
+
+    success: bool
+
+    R: np.ndarray          # (3,3) Camera-to-world rotation
+
+    t: np.ndarray          # (3,) Camera center in world
+
+    inlier_ids: np.ndarray
+
+    num_inliers: int
+
+    reprojection_error: float
