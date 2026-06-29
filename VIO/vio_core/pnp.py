@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import numpy as np
 
+import cv2
+
 
 @dataclass
 class PnPCorrespondence:
@@ -119,6 +121,26 @@ def solve_pnp(
     print("Object points :", object_points.shape)
     print("Image points  :", image_points.shape)
     print("===============================\n")
+
+    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            K,
+            None,                       # images are already undistorted
+            flags=cv2.SOLVEPNP_ITERATIVE,
+            reprojectionError=4.0,
+            confidence=0.99,
+            iterationsCount=100,
+        )
+    print("\n========== PnP RESULT ==========")
+    print("Success :", success)
+
+    if inliers is None:
+        print("Inliers : 0")
+    else:
+        print("Inliers :", len(inliers))
+
+    print("================================\n")
 
 
 from dataclasses import dataclass
