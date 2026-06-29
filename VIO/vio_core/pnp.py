@@ -132,6 +132,33 @@ def solve_pnp(
             confidence=0.99,
             iterationsCount=100,
         )
+    
+
+    #Frame conversion: OpenCV uses camera-to-world rotation, but we want world-to-camera rotation.
+
+    Rcw, _ = cv2.Rodrigues(rvec)
+
+    Rwc = Rcw.T
+
+    C = (-Rwc @ tvec).reshape(3)
+
+
+
+
+
+    print("\n========== PnP POSE ==========")
+
+    print("Camera Center:")
+    print(C)
+
+    print("\nRotation:")
+    print(Rwc)
+
+    print("==============================\n")
+
+
+
+
     print("\n========== PnP RESULT ==========")
     print("Success :", success)
 
