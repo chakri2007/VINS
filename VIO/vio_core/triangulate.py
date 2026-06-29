@@ -184,6 +184,8 @@ def triangulate_candidates(
     rejected = 0
 
     depths = []
+    angles = []
+    depth_angle_pairs = []
 
     for c, xyz in zip(candidates, X):
 
@@ -199,6 +201,17 @@ def triangulate_candidates(
             continue
 
         depths.append((z1 + z2) * 0.5)
+
+        angle = compute_triangulation_angle(
+            xyz,
+            c.view1,
+            c.view2,
+            view_set,
+        )
+
+        angles.append(angle)
+        depth_angle_pairs.append(((z1 + z2) * 0.5, angle))
+        
 
         triangulated.append(
             TriangulatedPoint(
@@ -228,6 +241,25 @@ def triangulate_candidates(
             f"median={np.median(depths):.2f}, "
             f"max={np.max(depths):.2f})"
         )
+        print(
+            "[Triangulation] "
+            f"Angle(min={np.min(angles):.2f}°, "
+            f"median={np.median(angles):.2f}°, "
+            f"mean={np.mean(angles):.2f}°, "
+            f"max={np.max(angles):.2f}°)"
+        )
+
+        depth_angle_pairs.sort(key=lambda x: x[0])
+
+        print("\n========== DEEPEST LANDMARKS ==========")
+
+        for depth, angle in depth_angle_pairs[-10:]:
+            print(
+                f"Depth = {depth:8.2f} m    "
+                f"Angle = {angle:5.2f}°"
+            )
+
+        print("=======================================\n")
 
     return triangulated
 

@@ -1,8 +1,4 @@
 import numpy as np
-from vio_core.landmarks import Landmark
-from vio_core.triangulate import compute_triangulation_angle
-
-angles = []
 
 def reprojection_error(
     landmark,
@@ -38,14 +34,6 @@ def reprojection_error(
 
         errors.append(err)
 
-        angle = compute_triangulation_angle(
-        landmark.xyz,
-        landmark.observations[0].view_id,
-        landmark.observations[1].view_id,
-        view_set,
-    )
-
-    angles.append(angle)
 
     if len(errors) == 0:
         return np.inf, []
