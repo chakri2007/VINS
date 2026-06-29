@@ -25,4 +25,4 @@ def preprocess_image(raw_img, distortion_coeffs, K, params=None):
         )
         img = clahe.apply(img)
     
-    return img
+    return img, new_K

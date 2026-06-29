@@ -115,6 +115,39 @@ class ViewSet:
             self.camera_projection_matrix(view1, K),
             self.camera_projection_matrix(view2, K),
         )
+    
+    def project_point(
+        self,
+        view_id: int,
+        K: np.ndarray,
+        xyz: np.ndarray,
+    ):
+        """
+        Project a world point into an image.
+
+        Parameters
+        ----------
+        xyz : (3,)
+            World coordinates.
+
+        Returns
+        -------
+        uv : (2,)
+            Pixel coordinates.
+        """
+
+        R, t = self.get_pose(view_id)
+
+        # World → Camera
+        pc = R.T @ (xyz - t)
+
+        if pc[2] <= 0:
+            return None
+
+        uv = K @ pc
+        uv = uv[:2] / uv[2]
+
+        return uv
 
     # ------------------------------------------------------------------ #
     #  Properties                                                          #

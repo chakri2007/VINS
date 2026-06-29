@@ -10,6 +10,8 @@ from memory_management.sliding_window import SlidingWindowState, update_sliding_
 
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
 
+from vio_core.reprojection import validate_landmarks
+
 
 class VisualInertialOdometry():
     def __init__(self, calib_data):
@@ -23,11 +25,13 @@ class VisualInertialOdometry():
             self.left_calib['T_BS']['data']
         ).reshape(4, 4)
 
-        self.K = np.array([
+        self.K_raw = np.array([
             [self.intrinsics[0], 0,                  self.intrinsics[2]],
             [0,                  self.intrinsics[1], self.intrinsics[3]],
             [0,                  0,                  1],
         ], dtype=np.float64)
+
+        self.K = self.K_raw.copy()
 
         self.params = {
             'Equalize':         False,
@@ -61,10 +65,10 @@ class VisualInertialOdometry():
 
     def vio_loop(self, raw_img_frame, img_frame_timestamp):
         self.frameID += 1
-        self.img_frame = preprocess_image(
+        self.img_frame, self.K = preprocess_image(
             raw_img_frame,
             self.distortion_coeffs,
-            self.K,
+            self.K_raw,
             self.params,
         )
 
@@ -235,6 +239,13 @@ class VisualInertialOdometry():
                     f"Landmark database size: "
                     f"{len(self.sw_state.landmarks)}"
                 )
+
+                validate_landmarks(
+                self.sw_state,
+                self.view_set,
+                self.K,
+            )
+
 
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #
