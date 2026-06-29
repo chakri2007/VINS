@@ -8,7 +8,7 @@ from feature_manager.feature_extractor import FeatureExtractor
 from memory_management.view_set import ViewSet
 from memory_management.sliding_window import SlidingWindowState, update_sliding_window
 
-from vio_core.triangulate import find_triangulation_candidates
+from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates
 
 
 class VisualInertialOdometry():
@@ -218,6 +218,13 @@ class VisualInertialOdometry():
                 )
 
                 print(f"Found {len(candidates)} triangulation candidates")
+                triangulated = triangulate_candidates(
+                    candidates,
+                    self.view_set,
+                    self.K,
+                )
+
+                print(f"Triangulated landmarks: {len(triangulated)}")
 
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #

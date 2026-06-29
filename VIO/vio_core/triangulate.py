@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import List
 
 import numpy as np
-
+import cv2
 
 @dataclass
 class TriangulationCandidate:
@@ -103,3 +103,129 @@ def find_triangulation_candidates(
     )
 
     return candidates
+def triangulate_candidates(
+    candidates,
+    view_set,
+    K,
+):
+    """
+    Triangulate feature correspondences between two keyframes.
+
+    Parameters
+    ----------
+    candidates : list[TriangulationCandidate]
+
+    Returns
+    -------
+    list[TriangulatedPoint]
+    """
+
+    if len(candidates) == 0:
+        return []
+
+    view1 = candidates[0].view1
+    view2 = candidates[0].view2
+
+    #
+    # Projection matrices
+    #
+    P1, P2 = view_set.get_projection_matrices(
+        view1,
+        view2,
+        K,
+    )
+
+    #
+    # Build point arrays
+    #
+    pts1 = np.array([c.uv1 for c in candidates], dtype=np.float64).T
+    pts2 = np.array([c.uv2 for c in candidates], dtype=np.float64).T
+
+    #
+    # Linear triangulation
+    #
+    X_h = cv2.triangulatePoints(
+        P1,
+        P2,
+        pts1,
+        pts2,
+    )
+
+    #
+    # Homogeneous -> Euclidean
+    #
+    X = (X_h[:3] / X_h[3]).T
+
+    #
+    # Camera poses
+    #
+    R1, t1 = view_set.get_pose(view1)
+    R2, t2 = view_set.get_pose(view2)
+
+    triangulated = []
+
+    rejected = 0
+
+    depths = []
+
+    for c, xyz in zip(candidates, X):
+
+        #
+        # Cheirality test
+        #
+
+        z1 = (R1.T @ (xyz - t1))[2]
+        z2 = (R2.T @ (xyz - t2))[2]
+
+        if z1 <= 0 or z2 <= 0:
+            rejected += 1
+            continue
+
+        depths.append((z1 + z2) * 0.5)
+
+        triangulated.append(
+            TriangulatedPoint(
+                point_id=c.point_id,
+                xyz=xyz,
+
+                view1=c.view1,
+                view2=c.view2,
+
+                uv1=c.uv1,
+                uv2=c.uv2,
+            )
+        )
+
+    print(
+        f"[Triangulation] "
+        f"Input={len(candidates)} | "
+        f"Valid={len(triangulated)} | "
+        f"Rejected={rejected}"
+    )
+
+    if len(depths):
+
+        print(
+            "[Triangulation] "
+            f"Depth(min={np.min(depths):.2f}, "
+            f"median={np.median(depths):.2f}, "
+            f"max={np.max(depths):.2f})"
+        )
+
+    return triangulated
+
+@dataclass
+class TriangulatedPoint:
+    """
+    One successfully reconstructed 3D point.
+    """
+
+    point_id: int
+
+    xyz: np.ndarray          # (3,)
+
+    view1: int
+    view2: int
+
+    uv1: np.ndarray
+    uv2: np.ndarray
