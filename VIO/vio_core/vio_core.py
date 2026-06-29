@@ -198,27 +198,17 @@ class VisualInertialOdometry():
         self.prev_img_frame = img_frame
 
         # ── branch on window state ────────────────────────────────────────
-        # MATLAB adds every frame to viewSet with identity pose as placeholder.
-        # removedFrameIds marks the non-keyframes so downstream can filter them.
-        # Only the isEnoughParallax frame gets a real estimated pose.
-        if window_state['isEnoughParallax']:
+        if window_state['isFirstFewViews']:
+            self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3))
+
+        elif window_state['isEnoughParallax']:
             success = self._initialise_map(frameID)
             if success:
                 self.isMapInitialized  = True
                 self.isVIO_initialized = True
-                kf_ids = [v for v in self.view_set.view_ids if v not in self.removed_frame_ids]
-                print(f"[Frame {frameID}] Map initialized. Total views: {len(self.view_set.view_ids)}, Keyframes: {len(kf_ids)}, Non-KF: {len(self.removed_frame_ids)}")
-            else:
-                # Pose estimation failed — add as identity placeholder
-                self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3))
-                self.removed_frame_ids.append(frameID)
-        else:
-            # isFirstFewViews, isWindowFull with non-KF replacement, or
-            # warm-up discard — all get an identity placeholder.
-            self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3))
-            # Mark non-keyframes (replaced frames) so Phase 2 can skip them.
-            if not self.sw_state.is_key_frame.get(frameID, False):
-                self.removed_frame_ids.append(frameID)
+                print(f"[Frame {frameID}] Map initialized with {len(self.view_set.view_ids)} views.")
+
+                print(f"view_set.view_ids: {self.view_set.view_ids}, poses: {self.view_set.get_all_poses()}")
 
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #
