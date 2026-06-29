@@ -253,12 +253,19 @@ class VisualInertialOdometry():
                 current_view_id=frameID,
             )
 
-            solve_pnp(
+            Rwc, C, inliers = solve_pnp(
                 correspondences,
                 self.K,
             )
+            print("==============================\n") 
+            R_view, t_view = self.view_set.get_pose( correspondences[0].view_id )
 
-
+            position_error = np.linalg.norm(C - t_view) 
+            rotation_error = np.degrees( np.arccos( np.clip( (np.trace(Rwc @ R_view.T) - 1) / 2, -1.0, 1.0, ) ) ) 
+            print("\n========== PnP vs ViewSet ==========") 
+            print(f"Position Error : {position_error:.4f} m") 
+            print(f"Rotation Error : {rotation_error:.3f} deg") 
+            print("====================================")
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #
     # ------------------------------------------------------------------ #

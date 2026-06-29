@@ -156,9 +156,7 @@ def solve_pnp(
 
     print("==============================\n")
 
-
-
-
+    
     print("\n========== PnP RESULT ==========")
     print("Success :", success)
 
@@ -168,6 +166,8 @@ def solve_pnp(
         print("Inliers :", len(inliers))
 
     print("================================\n")
+
+    return Rwc, C, inliers
 
 
 from dataclasses import dataclass
