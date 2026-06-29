@@ -208,6 +208,8 @@ class VisualInertialOdometry():
                 self.isVIO_initialized = True
                 print(f"[Frame {frameID}] Map initialized with {len(self.view_set.view_ids)} views.")
 
+                print(f"view_set.view_ids: {self.view_set.view_ids}, poses: {self.view_set.get_all_poses()}")
+
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #
     # ------------------------------------------------------------------ #
