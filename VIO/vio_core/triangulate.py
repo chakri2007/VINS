@@ -135,6 +135,23 @@ def triangulate_candidates(
         K,
     )
 
+    R1, t1 = view_set.get_pose(view1)
+    R2, t2 = view_set.get_pose(view2)
+
+    print("\n========== TRIANGULATION DEBUG ==========")
+    print(f"Views : {view1} -> {view2}")
+    print("\nCamera 1")
+    print("R=\n", R1)
+    print("t=", t1)
+
+    print("\nCamera 2")
+    print("R=\n", R2)
+    print("t=", t2)
+
+    print("\nP1=\n", P1)
+    print("\nP2=\n", P2)
+    print("=========================================\n")
+
     #
     # Build point arrays
     #
