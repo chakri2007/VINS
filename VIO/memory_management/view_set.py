@@ -95,6 +95,26 @@ class ViewSet:
         Rt = R.T                          # world-to-camera rotation
         tt = -(Rt @ t).reshape(3, 1)      # world-to-camera translation
         return K @ np.hstack([Rt, tt])    # (3,4)
+    
+    def get_projection_matrices(
+        self,
+        view1: int,
+        view2: int,
+        K: np.ndarray,
+    ):
+        """
+        Convenience function for triangulation.
+
+        Returns
+        -------
+        P1 : (3,4)
+        P2 : (3,4)
+        """
+
+        return (
+            self.camera_projection_matrix(view1, K),
+            self.camera_projection_matrix(view2, K),
+        )
 
     # ------------------------------------------------------------------ #
     #  Properties                                                          #

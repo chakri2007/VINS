@@ -8,6 +8,8 @@ from feature_manager.feature_extractor import FeatureExtractor
 from memory_management.view_set import ViewSet
 from memory_management.sliding_window import SlidingWindowState, update_sliding_window
 
+from vio_core.triangulate import find_triangulation_candidates
+
 
 class VisualInertialOdometry():
     def __init__(self, calib_data):
@@ -209,6 +211,13 @@ class VisualInertialOdometry():
                 print(f"[Frame {frameID}] Map initialized with {len(self.view_set.view_ids)} views.")
 
                 print(f"view_set.view_ids: {self.view_set.view_ids}, poses: {self.view_set.get_all_poses()}")
+
+                candidates = find_triangulation_candidates(
+                    self.sw_state,
+                    self.view_set,
+                )
+
+                print(f"Found {len(candidates)} triangulation candidates")
 
     # ------------------------------------------------------------------ #
     #  Phase 1 helpers                                                     #

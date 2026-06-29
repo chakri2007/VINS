@@ -20,6 +20,26 @@ from typing import Callable, Optional
 import numpy as np
 
 from vio_core.ransac import estimate_fundamental_matrix_ransac
+from typing import Dict, Tuple
+
+@dataclass
+class Landmark:
+    """
+    A reconstructed 3D landmark.
+
+    One Landmark corresponds to one feature point ID that has been
+    triangulated into 3D.
+    """
+
+    point_id: int
+
+    xyz: np.ndarray
+
+    first_view: int
+
+    observations: list = field(default_factory=list)
+
+    is_triangulated: bool = True
 
 
 @dataclass
@@ -40,6 +60,17 @@ class SlidingWindowState:
 
     # point_id -> int — how many frames this point has survived in
     key_point_track_count: dict = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Landmark database
+    #
+    # key:
+    #     feature point id
+    #
+    # value:
+    #     Landmark
+    # ------------------------------------------------------------------
+    landmarks: Dict[int, Landmark] = field(default_factory=dict)
 
     # last view_id that was fully written into all_observations / all_ids
     current_view_id: int = -1
