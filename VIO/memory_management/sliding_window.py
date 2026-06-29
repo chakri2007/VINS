@@ -22,6 +22,8 @@ import numpy as np
 from vio_core.ransac import estimate_fundamental_matrix_ransac
 from typing import Dict, Tuple
 
+from vio_core.landmarks import Landmark
+
 @dataclass
 class Landmark:
     """

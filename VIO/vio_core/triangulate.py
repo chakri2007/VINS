@@ -231,6 +231,70 @@ def triangulate_candidates(
 
     return triangulated
 
+from vio_core.landmarks import Landmark
+
+def add_landmarks(
+    triangulated_points,
+    sliding_window_state,
+):
+    """
+    Insert newly triangulated points into the landmark database.
+
+    Returns
+    -------
+    num_added
+    """
+
+    added = 0
+
+    for p in triangulated_points:
+
+        #
+        # Skip if landmark already exists
+        #
+        if p.point_id in sliding_window_state.landmarks:
+            continue
+
+        landmark = Landmark(
+            point_id=p.point_id,
+            xyz=p.xyz.copy(),
+            first_view=p.view1,
+        )
+
+        landmark.add_observation(
+            p.view1,
+            p.uv1,
+        )
+
+        landmark.add_observation(
+            p.view2,
+            p.uv2,
+        )
+
+        sliding_window_state.landmarks[p.point_id] = landmark
+
+        #
+        # Update triangulation flags
+        #
+        for view_id in (p.view1, p.view2):
+
+            ids = sliding_window_state.all_ids[view_id]
+
+            idx = np.where(ids[:, 1] == p.point_id)[0]
+
+            if len(idx):
+
+                sliding_window_state.all_triangulated[view_id][idx[0]] = True
+
+        added += 1
+
+    print(
+        f"[Landmarks] Added {added} landmarks."
+    )
+
+    return added
+
+
 @dataclass
 class TriangulatedPoint:
     """
