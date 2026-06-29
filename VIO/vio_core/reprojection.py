@@ -94,12 +94,3 @@ def validate_landmarks(
         print(
             f"Maximum    : {np.max(all_errors):.3f} px"
         )
-
-    print("=========================================\n")
-
-    print("\n========== TRIANGULATION ANGLES ==========")
-    print(f"Min    : {np.min(angles):.2f} deg")
-    print(f"Median : {np.median(angles):.2f} deg")
-    print(f"Mean   : {np.mean(angles):.2f} deg")
-    print(f"Max    : {np.max(angles):.2f} deg")
-    print("==========================================")

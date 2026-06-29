@@ -22,6 +22,8 @@ from typing import List
 import numpy as np
 import cv2
 
+MIN_TRIANGULATION_ANGLE = 1.0      # degrees
+
 @dataclass
 class TriangulationCandidate:
     """
@@ -181,7 +183,8 @@ def triangulate_candidates(
 
     triangulated = []
 
-    rejected = 0
+    cheirality_rejected = 0
+    angle_rejected = 0
 
     depths = []
     angles = []
@@ -189,19 +192,19 @@ def triangulate_candidates(
 
     for c, xyz in zip(candidates, X):
 
-        #
-        # Cheirality test
-        #
-
         z1 = (R1.T @ (xyz - t1))[2]
         z2 = (R2.T @ (xyz - t2))[2]
 
+        #
+        # Cheirality check
+        #
         if z1 <= 0 or z2 <= 0:
-            rejected += 1
+            cheirality_rejected += 1
             continue
 
-        depths.append((z1 + z2) * 0.5)
-
+        #
+        # Triangulation angle
+        #
         angle = compute_triangulation_angle(
             xyz,
             c.view1,
@@ -209,29 +212,39 @@ def triangulate_candidates(
             view_set,
         )
 
-        angles.append(angle)
-        depth_angle_pairs.append(((z1 + z2) * 0.5, angle))
-        
+        if angle < MIN_TRIANGULATION_ANGLE:
+            angle_rejected += 1
+            continue
 
+        #
+        # Diagnostics
+        #
+        depth = 0.5 * (z1 + z2)
+
+        depths.append(depth)
+        angles.append(angle)
+        depth_angle_pairs.append((depth, angle))
+
+        #
+        # Accept landmark
+        #
         triangulated.append(
             TriangulatedPoint(
                 point_id=c.point_id,
                 xyz=xyz,
-
                 view1=c.view1,
                 view2=c.view2,
-
                 uv1=c.uv1,
                 uv2=c.uv2,
             )
         )
 
-    print(
-        f"[Triangulation] "
-        f"Input={len(candidates)} | "
-        f"Valid={len(triangulated)} | "
-        f"Rejected={rejected}"
-    )
+    print("\n========== TRIANGULATION SUMMARY ==========")
+    print(f"Input candidates      : {len(candidates)}")
+    print(f"Accepted              : {len(triangulated)}")
+    print(f"Rejected (cheirality) : {cheirality_rejected}")
+    print(f"Rejected (angle)      : {angle_rejected}")
+    print("===========================================\n")
 
     if len(depths):
 
