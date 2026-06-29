@@ -123,14 +123,6 @@ class VisualOdometryPipeline:
         self._motion_estimator = me
 
     def set_frame_callback(self, cb) -> None:
-        """
-        [Fix Issue 4] Renamed from set_keyframe_callback → set_frame_callback
-        to match vo_subscriber.py.
-
-        cb(timestamp: float) is called on EVERY camera frame so the IMU
-        pipeline cuts one chunk per frame interval.
-        [Fix Issue 5] Callback is now wired and fires every frame.
-        """
         self._on_frame_cb = cb
 
     # kept for backwards compatibility

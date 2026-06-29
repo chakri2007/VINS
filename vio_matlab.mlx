@@ -1,0 +1,380 @@
+%% Setup
+data = helperDownloadVIOData();
+rng(0)
+
+%% Initialize Algorithm Parameters
+params = helperVIOParameters;
+status = struct("isFirstFrame",true,"isMapInitialized",false,"isIMUAligned",false,"isMedianDepthEstimated",false);
+initialSceneMedianDepth = 4;
+viewID = 0;
+removedFrameIDs = [];
+allCameraTracks = cell(1,5000);
+
+fg = factorGraph;
+maxFrames = 10000;
+maxLandmarks = 100000;
+ids = helperGenerateNodeID(fg,maxFrames,maxLandmarks);
+
+tracker = vision.PointTracker(MaxBidirectionalError=params.KLT_BiErr, ...
+        NumPyramidLevels=params.KLT_Levels,BlockSize=params.KLT_Block);
+
+fpManager = helperFeaturePointManager(data.intrinsics,params,maxFrames,maxLandmarks);
+fpManager.DetectorFunc = @(I)helperDetectKeyPoints(I);
+
+viewSet = imageviewset;
+
+startFrameIdx = 40;
+endFrameIdx = 1000;
+allFrameIDs = startFrameIdx:endFrameIdx;
+
+
+
+
+
+
+
+
+
+%% Phase 1: Structure from Motion (SfM)
+
+currFrameIdx = startFrameIdx;
+while ~status.isMapInitialized && currFrameIdx < endFrameIdx
+    I = data.images{currFrameIdx};
+    viewID = viewID + 1;
+    I = helperProcessImage(I,params,data.intrinsics);
+
+    if status.isFirstFrame
+        currPoints = createNewFeaturePoints(fpManager,I);
+        updateSlidingWindow(fpManager,I,currPoints,true(size(currPoints,1),1),viewID);
+        initialize(tracker, currPoints, I);
+        firstI = I;
+        viewSet = addView(viewSet,viewID,rigidtform3d);
+        status.isFirstFrame = false;
+    else
+        [currPoints,validIdx] = tracker(I);
+        [removedFrameID,windowState] = updateSlidingWindow(fpManager,I,currPoints,validIdx,viewID);
+        if (removedFrameID > fpManager.slidingWindowViewIDs(1))
+            removedFrameIDs(end + 1) = removedFrameID;
+        end
+
+        if windowState.isFirstFewViews
+            viewSet = addView(viewSet,viewID,rigidtform3d);
+
+        elseif windowState.isEnoughParallax
+            swIDs = getSlidingWindowIDs(fpManager);
+            [matches1,matches2] = get2DCorrespondensesBetweenViews(fpManager,swIDs(end-1),swIDs(end));
+
+            inliersIndex = false(size(matches1,1),1);
+            for k = 1:10
+                [f,inliers] = estimateFundamentalMatrix( ...
+                    matches1,matches2,Method="RANSAC", ...
+                    NumTrials=params.F_Iterations,DistanceThreshold=params.F_Threshold, ...
+                    Confidence=params.F_Confidence);
+                if length(find(inliersIndex)) < length(find(inliers))
+                    inliersIndex = inliers;
+                    fundamentalMatrix = f;
+                end
+            end
+
+            inlierPrePoints = matches1(inliersIndex,:);
+            inlierCurrPoints = matches2(inliersIndex,:);
+            relPose = estrelpose(fundamentalMatrix,data.intrinsics,inlierPrePoints,inlierCurrPoints);
+            viewSet = addView(viewSet,viewID,relPose);
+            status.isMapInitialized = true;
+            break
+
+        end
+
+        createNewFeaturePoints(fpManager,I);
+        currPoints = getKeyPointsInView(fpManager,viewID);
+        setPoints(tracker,currPoints);
+    end
+    currFrameIdx = currFrameIdx + 1;
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+%% Phase 2: Camera-IMU Alignment
+cameraInformation = ((data.intrinsics.K(1,1)/1.5)^2)*eye(2);
+imuParams = factorIMUParameters(SampleRate=100,GyroscopeNoise=0.1, ...
+    GyroscopeBiasNoise=3e-3,AccelerometerNoise=0.3, ...
+    AccelerometerBiasNoise=1e-3,ReferenceFrame="ENU");
+readyToAlignCameraAndIMU = false;
+
+while ~status.isIMUAligned
+    [newXYZ,newXYZID,newPointViews,newPointObs] = triangulateNew3DPoints(fpManager,viewSet);
+
+    newPointsTriangulated = false;
+    if ~isempty(newXYZ)
+        newPointsTriangulated = true;
+        for pIte = 1:length(newPointViews)
+            allCameraTracks{newPointViews(pIte)} = [allCameraTracks{newPointViews(pIte)}; newPointObs{pIte}];
+        end
+        obs = vertcat(newPointObs{:});
+        fCam = factorCameraSE3AndPointXYZ([ids.pose(obs(:,1)) ...
+            ids.point3(obs(:,2))],data.intrinsics.K, ...
+            Measurement=obs(:,3:4), ...
+            Information=cameraInformation);
+        addFactor(fg,fCam);
+    end
+
+    slidingWindowViewIDs = getSlidingWindowIDs(fpManager);
+    currentCameraPose = poses(viewSet,slidingWindowViewIDs(end));
+    nodeState(fg, ...
+        ids.pose(slidingWindowViewIDs(end)), ...
+        helperCameraPoseTableToSE3Vector(currentCameraPose));
+
+    if helperDecideToRunGraphOptimization(currFrameIdx,newPointsTriangulated,params)
+        nodeIdsToOptimize = ids.pose(slidingWindowViewIDs);
+        xyzIds = getPointIdsInViews(fpManager,slidingWindowViewIDs);
+        xyz = getXYZPoints(fpManager,xyzIds);
+        fg.nodeState(ids.point3(xyzIds),xyz);
+        helperFixNodes(fg,ids.pose,slidingWindowViewIDs,windowState.isWindowFull);
+        optiInfo = optimize(fg,nodeIdsToOptimize,params.SolverOpts);
+        helperUnFixNodes(fg,ids.pose,slidingWindowViewIDs,windowState.isWindowFull);
+
+        if ~status.isMedianDepthEstimated
+            status.isMedianDepthEstimated = true;
+            xyz = fg.nodeState(ids.point3(xyzIds));
+            EstimatedMedianDepth = median(vecnorm(xyz.'));
+            [posesUpdated,xyz] = helperTransformToNavigationFrame( ...
+                helperUpdateCameraPoseTable(poses(viewSet,slidingWindowViewIDs), ...
+                fg.nodeState(ids.pose(slidingWindowViewIDs))), ...
+                xyz,rigidtform3d,initialSceneMedianDepth/EstimatedMedianDepth);
+            fg.nodeState(ids.pose(slidingWindowViewIDs), ...
+                helperCameraPoseTableToSE3Vector(posesUpdated));
+            fg.nodeState(ids.point3(xyzIds),xyz);
+        else
+            posesUpdated = helperUpdateCameraPoseTable(poses(viewSet,slidingWindowViewIDs), ...
+                fg.nodeState(ids.pose(slidingWindowViewIDs)));
+            xyz = fg.nodeState(ids.point3(xyzIds));
+        end
+        viewSet = updateView(viewSet,posesUpdated);
+        setXYZPoints(fpManager,xyz,xyzIds);
+    end
+
+    createNewFeaturePoints(fpManager,I);
+    currPoints = getKeyPointsInView(fpManager,viewID);
+    setPoints(tracker,currPoints);
+
+    if windowState.isWindowFull && ~readyToAlignCameraAndIMU
+        readyToAlignCameraAndIMU = true;
+        helperPlotCameraPosesAndLandmarks(fpManager,viewSet,removedFrameIDs,true);
+    end
+
+    currFrameIdx = currFrameIdx + 1;
+    if currFrameIdx > endFrameIdx
+        break
+    else
+        I = data.images{currFrameIdx};
+        I = helperProcessImage(I,params,data.intrinsics);
+        viewID = viewID + 1;
+        [currPoints,validIdx] = tracker(I);
+        [removedFrameID,windowState] = updateSlidingWindow(fpManager,I,currPoints,validIdx,viewID);
+        if (removedFrameID > fpManager.slidingWindowViewIDs(1))
+            removedFrameIDs(end + 1) = removedFrameID;
+        end
+        swIDs = getSlidingWindowIDs(fpManager);
+        if length(swIDs) > 2
+            [matches1,matches2] = get2DCorrespondensesBetweenViews(fpManager,swIDs(end-2),viewID);
+        end
+
+        if readyToAlignCameraAndIMU
+            swIDs = getSlidingWindowIDs(fpManager);
+            swIDs = swIDs(1:end-1);
+            [gyro,accel] = helperExtractIMUDataBetweenViews( ...
+                data.gyroReadings,data.accelReadings,data.timeStamps,allFrameIDs(swIDs));
+            [xyz] = getXYZPoints(fpManager,xyzIds);
+            camPoses = poses(viewSet,swIDs);
+            [gRot,scale,info] = ...
+                estimateGravityRotationAndPoseScale(camPoses,gyro,accel, ...
+                SensorTransform=data.camToIMUTransform,IMUParameters=imuParams);
+            disp("Estimated scale: " + scale);
+
+            if info.IsSolutionUsable && scale > 1e-3
+                status.isIMUAligned = true;
+                posesUpdated = poses(viewSet);
+                [posesUpdated,xyz] = helperTransformToNavigationFrame(posesUpdated,xyz,gRot,scale);
+                viewSet = updateView(viewSet,posesUpdated);
+                helperPlotCameraIMUAlignment(data,camPoses,scale,allFrameIDs);
+
+                for k = 1:length(gyro)
+                    nId = [ids.pose(swIDs(k)),ids.vel(swIDs(k)),ids.bias(swIDs(k)), ...
+                        ids.pose(swIDs(k+1)),ids.vel(swIDs(k+1)),ids.bias(swIDs(k+1))];
+                    fIMU = factorIMU(nId,gyro{k},accel{k},imuParams,SensorTransform=data.camToIMUTransform);
+                    fg.addFactor(fIMU);
+                end
+
+                fg.nodeState(ids.pose(swIDs), ...
+                    helperCameraPoseTableToSE3Vector(poses(viewSet,swIDs)));
+                fg.nodeState(ids.point3(xyzIds),xyz);
+
+                fixNode(fg,ids.pose(swIDs));
+                fixNode(fg,ids.point3(xyzIds));
+                fVelPrior = factorVelocity3Prior(ids.vel(swIDs(1)));
+                addFactor(fg,fVelPrior);
+                fBiasPrior = factorIMUBiasPrior(ids.bias(swIDs(1)));
+                addFactor(fg,fBiasPrior);
+
+                soll1 = optimize(fg,params.SolverOpts);
+                fixNode(fg,ids.pose(swIDs),false);
+                fixNode(fg,ids.point3(xyzIds),false);
+                fixNode(fg,ids.pose(swIDs(1)));
+                soll = optimize(fg,params.SolverOpts);
+                fixNode(fg,ids.pose(swIDs(1)),false);
+
+                viewSet = updateView(viewSet,helperUpdateCameraPoseTable(poses(viewSet,swIDs), ...
+                    fg.nodeState(ids.pose(swIDs))));
+                xyz = fg.nodeState(ids.point3(xyzIds));
+                setXYZPoints(fpManager,xyz,xyzIds);
+            end
+        else
+            [currPoints,pointIds,isTriangulated] = getKeyPointsInView(fpManager,viewID);
+            hasTriangulatedPoints = true(size(currPoints,1),1);
+            triangulatedPoints = find(isTriangulated);
+            x3D = getXYZPoints(fpManager,pointIds(isTriangulated));
+            c2D = currPoints(isTriangulated,:);
+            ii = false(size(x3D,1),1);
+            currPose = rigidtform3d;
+            [currPose,ii] = helperEstimateCameraPose(params,c2D,x3D,data.intrinsics,currPose,ii);
+            hasTriangulatedPoints(triangulatedPoints(~ii)) = false;
+            setKeyPointValidityInView(fpManager,viewID,hasTriangulatedPoints);
+            viewSet = addView(viewSet,viewID,currPose);
+
+            obs2 = pointIds(isTriangulated);
+            obs2 = obs2(ii);
+            fCam = factorCameraSE3AndPointXYZ( ...
+                [ids.pose(viewID*ones(size(obs2))) ids.point3(obs2)], ...
+                data.intrinsics.K,Measurement=c2D(ii,:), ...
+                Information=cameraInformation);
+            allCameraTracks{viewID} = [viewID*ones(size(obs2)) obs2 fCam.Measurement];
+            fg.addFactor(fCam);
+        end
+    end
+end
+
+%% Phase 3: Visual-Inertial Optimization
+visualizeTrajectory = true;
+if visualizeTrajectory
+    axTraj = [];
+    axFactorGraph = axes(figure);
+end
+
+while currFrameIdx < endFrameIdx + 1
+    swIDs = getSlidingWindowIDs(fpManager);
+    svs = swIDs((end-1):end);
+    [gyro,accel] = helperExtractIMUDataBetweenViews(data.gyroReadings, ...
+        data.accelReadings,data.timeStamps,allFrameIDs(svs));
+    nodeID = [ids.pose(svs(1)) ids.vel(svs(1))  ids.bias(svs(1)) ...
+              ids.pose(svs(2)) ids.vel(svs(2))  ids.bias(svs(2))];
+    fIMU = factorIMU(nodeID,gyro{1},accel{1},imuParams, ...
+        SensorTransform=data.camToIMUTransform);
+    fg.addFactor(fIMU);
+
+    prevP    = nodeState(fg,ids.pose(svs(1)));
+    prevVel  = nodeState(fg,ids.vel(svs(1)));
+    prevBias = nodeState(fg,ids.bias(svs(1)));
+    [pp,pv]  = fIMU.predict(prevP,prevVel,prevBias);
+
+    [currPoints,pointIds,isTriangulated] = getKeyPointsInView(fpManager,viewID);
+    hasTriangulatedPoints = true(size(currPoints,1),1);
+    triangulatedPoints = find(isTriangulated);
+
+    x3D = getXYZPoints(fpManager,pointIds(isTriangulated));
+    c2D = currPoints(isTriangulated,:);
+    [currPose,velRefined,biasRefined,ii] = helperBundleAdjustmentMotion( ...
+        x3D,c2D,data.intrinsics,size(I),pp,pv,prevP,prevVel,prevBias,fIMU);
+    fg.nodeState(ids.vel(viewID),velRefined);
+    fg.nodeState(ids.bias(viewID),biasRefined);
+    hasTriangulatedPoints(triangulatedPoints(~ii)) = false;
+    setKeyPointValidityInView(fpManager,viewID,hasTriangulatedPoints);
+    viewSet = addView(viewSet,viewID,currPose);
+
+    obs2 = pointIds(isTriangulated);
+    obs2 = obs2(ii);
+    fCam = factorCameraSE3AndPointXYZ( ...
+        [ids.pose(viewID*ones(size(obs2))) ids.point3(obs2)], ...
+        data.intrinsics.K,Measurement=c2D(ii,:),Information=cameraInformation);
+    allCameraTracks{viewID} = [viewID*ones(size(obs2)) obs2 fCam.Measurement];
+    fg.addFactor(fCam);
+
+    [newXYZ,newXYZID,newPointViews,newPointObs] = triangulateNew3DPoints(fpManager,viewSet);
+    newPointsTriangulated = false;
+    if ~isempty(newXYZ)
+        newPointsTriangulated = true;
+        for pIte = 1:length(newPointViews)
+            allCameraTracks{newPointViews(pIte)} = [allCameraTracks{newPointViews(pIte)}; newPointObs{pIte}];
+        end
+        obs = vertcat(newPointObs{:});
+        fCam = factorCameraSE3AndPointXYZ([ids.pose(obs(:,1)) ...
+            ids.point3(obs(:,2))],data.intrinsics.K, ...
+            Measurement=obs(:,3:4),Information=cameraInformation);
+        addFactor(fg,fCam);
+    end
+
+    slidingWindowViewIDs = getSlidingWindowIDs(fpManager);
+    currentCameraPose = poses(viewSet,slidingWindowViewIDs(end));
+    nodeState(fg, ...
+        ids.pose(slidingWindowViewIDs(end)), ...
+        helperCameraPoseTableToSE3Vector(currentCameraPose));
+
+    if helperDecideToRunGraphOptimization(currFrameIdx,newPointsTriangulated,params)
+        nodeIdsToOptimize = ids.pose(slidingWindowViewIDs);
+        xyzIds = getPointIdsInViews(fpManager,slidingWindowViewIDs);
+        xyz = getXYZPoints(fpManager,xyzIds);
+        fg.nodeState(ids.point3(xyzIds),xyz);
+        helperFixNodes(fg,ids.pose,slidingWindowViewIDs,windowState.isWindowFull);
+        fixNode(fg,ids.vel(slidingWindowViewIDs(1)));
+        fixNode(fg,ids.bias(slidingWindowViewIDs(1)));
+        optiInfo = optimize(fg,nodeIdsToOptimize,params.SolverOpts);
+        helperUnFixNodes(fg,ids.pose,slidingWindowViewIDs,windowState.isWindowFull);
+        posesUpdated = helperUpdateCameraPoseTable(poses(viewSet,slidingWindowViewIDs), ...
+            fg.nodeState(ids.pose(slidingWindowViewIDs)));
+        xyz = fg.nodeState(ids.point3(xyzIds));
+        viewSet = updateView(viewSet,posesUpdated);
+        setXYZPoints(fpManager,xyz,xyzIds);
+
+        if visualizeTrajectory && mod(currFrameIdx,params.optimizationFrequency*4)==0
+            axTraj = helperVisualizeTrajectory(axTraj,fpManager,viewSet,removedFrameIDs);
+            show(fg,"Landmark","on","Parent",axFactorGraph,"Legend","on");
+        end
+    end
+
+    createNewFeaturePoints(fpManager,I);
+    currPoints = getKeyPointsInView(fpManager,viewID);
+    setPoints(tracker,currPoints);
+
+    currFrameIdx = currFrameIdx + 1;
+    if currFrameIdx > endFrameIdx
+        break
+    end
+    I = data.images{currFrameIdx};
+    I = helperProcessImage(I,params,data.intrinsics);
+    viewID = viewID + 1;
+    [currPoints,validIdx] = tracker(I);
+    [removedFrameID,windowState] = updateSlidingWindow(fpManager,I,currPoints,validIdx,viewID);
+    if (removedFrameID > fpManager.slidingWindowViewIDs(1))
+        removedFrameIDs(end+1) = removedFrameID;
+    end
+    swIDs = getSlidingWindowIDs(fpManager);
+end
+
+%% Results
+axf = axes(figure);
+helperPlotAgainstGroundTruth(viewSet,data.gTruth,data.camToIMUTransform, ...
+    allFrameIDs(viewSet.Views.ViewId),axf,removedFrameIDs);
+helperComputeErrorAgainstGroundTruth(data.gTruth,viewSet,allFrameIDs, ...
+    removedFrameIDs,data.camToIMUTransform);
