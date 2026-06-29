@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from .ssc import ssc
 
 class FastDetector:
     def __init__(self,target_num_features = 200, num_feature_tolerance = 0.1):
