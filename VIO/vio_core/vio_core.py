@@ -12,6 +12,8 @@ from vio_core.triangulate import find_triangulation_candidates, triangulate_cand
 
 from vio_core.reprojection import validate_landmarks
 
+from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence
+
 
 class VisualInertialOdometry():
     def __init__(self, calib_data):
@@ -244,6 +246,11 @@ class VisualInertialOdometry():
                 self.sw_state,
                 self.view_set,
                 self.K,
+            )
+            
+            correspondences = find_pnp_correspondences(
+                self.sliding_window_state,
+                current_view_id=frameID,
             )
 
 
