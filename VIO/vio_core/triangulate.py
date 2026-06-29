@@ -231,6 +231,56 @@ def triangulate_candidates(
 
     return triangulated
 
+
+
+
+def compute_triangulation_angle(
+    xyz: np.ndarray,
+    view1: int,
+    view2: int,
+    view_set,
+) -> float:
+    """
+    Compute the triangulation angle (degrees) between two camera rays.
+
+    Parameters
+    ----------
+    xyz : (3,)
+        Landmark position in world coordinates.
+
+    view1, view2 : int
+        View IDs used for triangulation.
+
+    view_set : ViewSet
+
+    Returns
+    -------
+    angle_deg : float
+        Angle between the two viewing rays in degrees.
+    """
+
+    _, C1 = view_set.get_pose(view1)
+    _, C2 = view_set.get_pose(view2)
+
+    # Camera center -> landmark
+    v1 = xyz - C1
+    v2 = xyz - C2
+
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+
+    if n1 < 1e-12 or n2 < 1e-12:
+        return 0.0
+
+    v1 /= n1
+    v2 /= n2
+
+    cos_theta = np.clip(np.dot(v1, v2), -1.0, 1.0)
+
+    angle_deg = np.degrees(np.arccos(cos_theta))
+
+    return float(angle_deg)
+
 from vio_core.landmarks import Landmark
 
 def add_landmarks(

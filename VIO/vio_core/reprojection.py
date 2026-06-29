@@ -1,4 +1,8 @@
 import numpy as np
+from vio_core.landmarks import Landmark
+from vio_core.triangulate import compute_triangulation_angle
+
+angles = []
 
 def reprojection_error(
     landmark,
@@ -16,6 +20,7 @@ def reprojection_error(
 
     errors = []
 
+
     for obs in landmark.observations:
 
         uv_pred = view_set.project_point(
@@ -32,6 +37,15 @@ def reprojection_error(
         )
 
         errors.append(err)
+
+        angle = compute_triangulation_angle(
+        landmark.xyz,
+        landmark.observations[0].view_id,
+        landmark.observations[1].view_id,
+        view_set,
+    )
+
+    angles.append(angle)
 
     if len(errors) == 0:
         return np.inf, []
@@ -94,3 +108,10 @@ def validate_landmarks(
         )
 
     print("=========================================\n")
+
+    print("\n========== TRIANGULATION ANGLES ==========")
+    print(f"Min    : {np.min(angles):.2f} deg")
+    print(f"Median : {np.median(angles):.2f} deg")
+    print(f"Mean   : {np.mean(angles):.2f} deg")
+    print(f"Max    : {np.max(angles):.2f} deg")
+    print("==========================================")
