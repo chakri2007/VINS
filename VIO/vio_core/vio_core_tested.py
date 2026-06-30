@@ -13,10 +13,6 @@ from vio_core.triangulate import find_triangulation_candidates, triangulate_cand
 from vio_core.reprojection import validate_landmarks
 
 from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence, solve_pnp
-from optimization.factor_graph import FactorGraph
-from optimization.graph_builder import GraphBuilder
-from optimization.bundle_adjustment import BundleAdjuster
-from optimization.state_update import update_state_from_graph
 
 
 class VisualInertialOdometry():
@@ -49,9 +45,6 @@ class VisualInertialOdometry():
             'F_Confidence':     99,
             'F_Threshold':      4,
             'keyFrameParallax': 50,
-
-            'optimizationFrequency': 10,
-            'initialOptimizationFrames': 250,
         }
 
         self.feature_extractor = FeatureExtractor()
@@ -68,17 +61,12 @@ class VisualInertialOdometry():
 
         self.frameID = 0
 
-        self.factor_graph = FactorGraph(self.K)
+    # ------------------------------------------------------------------ #
+    #  Public entry points                                                 #
+    # ------------------------------------------------------------------ #
 
-        self.graph_builder = GraphBuilder()
-
-        self.bundle_adjustment = BundleAdjuster(self.factor_graph)
-
-
-    def vio_loop(self, raw_img_frame, timestamp):
-
+    def vio_loop(self, raw_img_frame, img_frame_timestamp):
         self.frameID += 1
-
         self.img_frame, self.K = preprocess_image(
             raw_img_frame,
             self.distortion_coeffs,
@@ -86,47 +74,12 @@ class VisualInertialOdometry():
             self.params,
         )
 
-        #
-        # First frame
-        #
-        if self.isFirstFrame:
-            self._init_first_frame(
-                self.img_frame,
-                self.frameID,
-            )
-            return
-
-        #
-        # Common frontend
-        #
-        window_state = self.process_frontend(
-            self.img_frame,
-            self.frameID,
-        )
-
-        #
-        # Phase selection
-        #
-        if not self.isMapInitialized:
-
-            self.vio_initialization(
-                window_state,
-                self.frameID,
-            )
-
+        if not self.isVIO_initialized:
+            self.vio_initialization(self.img_frame, img_frame_timestamp, self.frameID)
         elif not self.isVI_aligned:
-
-            self.VI_alignment(
-                window_state,
-                self.frameID,
-            )
-
+            self.VI_alignment()
         else:
-
-            self.visual_inertial_optimization(
-                window_state,
-                self.frameID,
-            )
+            self.visual_inertial_optimization()
 
     def process_frame_mono(self, raw_img_frame, img_frame_timestamp):
         self.vio_loop(raw_img_frame, img_frame_timestamp)
@@ -137,7 +90,33 @@ class VisualInertialOdometry():
             'D':      self.distortion_coeffs,
         }
 
-    def process_frontend(self, img_frame, frameID):
+    def get_active_tracks(self) -> dict:
+        """Build track history for every point visible in the active sliding window."""
+        tracks = {}
+        for view_id in self.sw_state.sliding_window_view_ids:
+            obs = self.sw_state.all_observations.get(view_id)
+            ids = self.sw_state.all_ids.get(view_id)
+            if obs is None or ids is None or len(obs) == 0:
+                continue
+            for point_id, (u, v) in zip(ids[:, 1], obs):
+                tracks.setdefault(int(point_id), []).append(
+                    (view_id, float(u), float(v))
+                )
+        return tracks
+
+    # ------------------------------------------------------------------ #
+    #  Phase 1 — Structure from Motion                                     #
+    # ------------------------------------------------------------------ #
+
+    def vio_initialization(self, img_frame, img_frame_timestamp, frameID):
+        if self.isFirstFrame:
+            self._init_first_frame(img_frame, frameID)
+            return
+
+        # ── Track from LAST STORED FRAME (not blindly frameID-1) ─────────
+        # When a frame was replaced/evicted in the sliding window,
+        # all_observations[frameID-1] may not exist.  Use current_view_id
+        # which always points to the last frame that was actually stored.
         prev_stored_id = self.sw_state.current_view_id
         prev_points    = self.sw_state.all_observations[prev_stored_id]
 
@@ -226,149 +205,149 @@ class VisualInertialOdometry():
 
         self.prev_img_frame = img_frame
 
-        return window_state
-    
-    def vio_initialization(self, window_state, frameID):
+        # ── branch on window state ────────────────────────────────────────
+        if window_state['isFirstFewViews']:
+            self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3))
 
-        if window_state["isFirstFewViews"]:
+        elif window_state['isEnoughParallax']:
+            success = self._initialise_map(frameID)
+            if success:
+                self.isMapInitialized  = True
+                self.isVIO_initialized = True
+                print(f"Map initialized")
 
-            self.view_set.add_view(
-                frameID,
-                np.eye(3),
-                np.zeros(3),
-            )
+    def _init_first_frame(self, img_frame, frameID):
+        features  = self.feature_extractor.detect_initial_features(img_frame)
+        num_pts   = len(features)
+        point_ids = np.arange(1, num_pts + 1)
 
-            return
-
-        if not window_state["isEnoughParallax"]:
-            return
-
-        success = self._initialise_map(frameID)
-
-        if success:
-
-            self.isMapInitialized = True
-
-            print("Map initialized.")
-
-    def VI_alignment(self, window_state, frameID):
-
-        if not self.run_pnp(frameID):
-            return
-        
-
-        new_points_added = self.run_triangulation()
-
-
-        # Build graph
-
-        self.graph_builder.update(
-            factor_graph=self.factor_graph,
-            view_set=self.view_set,
-            sw_state=self.sw_state,
-            current_view_id=frameID,
+        self.sw_state.all_observations[frameID]  = features
+        self.sw_state.all_ids[frameID]           = np.column_stack(
+            [np.full(num_pts, frameID), point_ids]
         )
-        self.factor_graph.print_summary()
+        self.sw_state.all_triangulated[frameID]  = np.zeros(num_pts, dtype=bool)
+        self.sw_state.is_key_frame[frameID]      = True
+        for pid in point_ids:
+            self.sw_state.key_point_track_count[pid] = 1
 
-        if self.should_run_bundle_adjustment(frameID,new_points_added,):
-            
-            self.fix_bundle_adjustment_poses(window_state)
-
-            result = self.bundle_adjustment.optimize()
-
-            if result is not None:
-                update_state_from_graph(
-                    self.factor_graph,
-                    self.view_set,
-                    self.sw_state,
-                )
-
-            self.bundle_adjustment.clear_fixed_poses()
-
-
-        # Median depth estimation
-        #
-        # IMU alignment
-
-    def run_pnp(self, frameID):
-
-        correspondences = find_pnp_correspondences(
-            self.sw_state,
-            frameID,
+        # update_sliding_window first-frame branch just registers the view_id
+        # and sets current_view_id = frameID.
+        update_sliding_window(
+            state               = self.sw_state,
+            image_shape         = img_frame.shape,
+            curr_points_tracked = features,
+            valid_idx           = np.ones(num_pts, dtype=bool),
+            view_id             = frameID,
+            F_loop              = self.params['F_loop'],
+            F_iterations        = self.params['F_Iterations'],
+            F_confidence        = self.params['F_Confidence'],
+            F_threshold         = self.params['F_Threshold'],
+            key_frame_parallax  = self.params['keyFrameParallax'],
         )
 
-        if len(correspondences) < 6:
+        self.prev_img_frame  = img_frame
+        self.first_img_frame = img_frame
+        self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3))
+        self.isFirstFrame = False
+
+    def _initialise_map(self, frameID) -> bool:
+        sw_ids = self.sw_state.sliding_window_view_ids
+        if len(sw_ids) < 2:
             return False
 
-        Rwc, C, inliers = solve_pnp(
-            correspondences,
-            self.K,
-        )
+        id1, id2 = sw_ids[-2], sw_ids[-1]
+        ids1 = self.sw_state.all_ids.get(id1)
+        ids2 = self.sw_state.all_ids.get(id2)
+        if ids1 is None or ids2 is None or len(ids1) < 8 or len(ids2) < 8:
+            return False
 
-        self.view_set.add_view(
-            frameID,
-            Rwc,
-            C,
-        )
+        _, ia, ib = np.intersect1d(ids1[:, 1], ids2[:, 1], return_indices=True)
+        if len(ia) < 8:
+            return False
 
+        matches1 = self.sw_state.all_observations[id1][ia]
+        matches2 = self.sw_state.all_observations[id2][ib]
+
+        best_F, best_inliers = None, None
+        for _ in range(10):
+            F, inliers = estimate_fundamental_matrix_ransac(
+                matches1, matches2,
+                num_trials     = self.params['F_Iterations'],
+                confidence     = self.params['F_Confidence'],
+                dist_threshold = self.params['F_Threshold'],
+            )
+            if F is None:
+                continue
+            if best_inliers is None or np.count_nonzero(inliers) > np.count_nonzero(best_inliers):
+                best_F, best_inliers = F, inliers
+
+        if best_F is None or np.count_nonzero(best_inliers) < 8:
+            return False
+
+        R, t = self._estimate_relative_pose(
+            best_F, matches1[best_inliers], matches2[best_inliers]
+        )
+        if R is None:
+            return False
+
+        self.view_set.add_view(view_id=frameID, R=R, t=t)
         return True
-    
-    def run_triangulation(self):
 
-        candidates = find_triangulation_candidates(
-            self.sw_state,
-            self.view_set,
+    def _estimate_relative_pose(self, F, pts1, pts2):
+        E = self.K.T @ F @ self.K
+        n_in, R, t, _ = cv2.recoverPose(
+            E, pts1.astype(np.float64), pts2.astype(np.float64), self.K
         )
+        if n_in < 8:
+            return None, None
+        # cv2 returns world-to-camera; invert to camera-to-world (MATLAB convention)
+        R_cw = R.T
+        t_cw = -(R_cw @ t.ravel())
+        return R_cw, t_cw
 
+
+
+    def VI_alignment(self):
+        candidates = find_triangulation_candidates(
+                    self.sw_state,
+                    self.view_set,
+                )
+
+        print(f"Found {len(candidates)} triangulation candidates")
         triangulated = triangulate_candidates(
             candidates,
             self.view_set,
             self.K,
         )
 
+        print(f"Triangulated landmarks: {len(triangulated)}")
+
         num_added = add_landmarks(
             triangulated,
             self.sw_state,
         )
 
-        validate_landmarks(
-            self.sw_state,
-            self.view_set,
-            self.K,
+        print(
+            f"Landmark database size: "
+            f"{len(self.sw_state.landmarks)}"
         )
 
-        return num_added > 0
-
-    def should_run_bundle_adjustment(
-        self,
-        frameID,
-        new_points_added,):
-
-        if frameID < self.params["initialOptimizationFrames"]:
-            return True
-
-        if frameID % self.params["optimizationFrequency"] == 0:
-            return True
-
-        if new_points_added:
-            return True
-
-        return False
+        validate_landmarks(
+        self.sw_state,
+        self.view_set,
+        self.K,
+    )
     
-    def fix_bundle_adjustment_poses(self, window_state):
+    correspondences = find_pnp_correspondences(
+        self.sw_state,
+        current_view_id=frameID,
+    )
 
-        sw_ids = list(self.sw_state.sliding_window_view_ids)
+    Rwc, C, inliers = solve_pnp(
+        correspondences,
+        self.K,
+    )
 
-        self.bundle_adjustment.clear_fixed_poses()
 
-        if window_state["isWindowFull"]:
-
-            for view_id in sw_ids[:11]:
-                self.bundle_adjustment.fix_pose(view_id)
-
-        else:
-
-            self.bundle_adjustment.fix_pose(sw_ids[0])
-
-    def visual_inertial_optimization(self, window_state, frameID):
+    def visual_inertial_optimization(self):
         pass
