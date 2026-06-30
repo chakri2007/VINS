@@ -266,6 +266,13 @@ while ~status.isIMUAligned
     end
 end
 
+
+
+
+
+
+
+
 %% Phase 3: Visual-Inertial Optimization
 visualizeTrajectory = true;
 if visualizeTrajectory

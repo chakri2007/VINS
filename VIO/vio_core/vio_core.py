@@ -214,63 +214,7 @@ class VisualInertialOdometry():
             if success:
                 self.isMapInitialized  = True
                 self.isVIO_initialized = True
-                print(f"[Frame {frameID}] Map initialized with {len(self.view_set.view_ids)} views.")
-
-                print(f"view_set.view_ids: {self.view_set.view_ids}, poses: {self.view_set.get_all_poses()}")
-
-                candidates = find_triangulation_candidates(
-                    self.sw_state,
-                    self.view_set,
-                )
-
-                print(f"Found {len(candidates)} triangulation candidates")
-                triangulated = triangulate_candidates(
-                    candidates,
-                    self.view_set,
-                    self.K,
-                )
-
-                print(f"Triangulated landmarks: {len(triangulated)}")
-
-                num_added = add_landmarks(
-                    triangulated,
-                    self.sw_state,
-                )
-
-                print(
-                    f"Landmark database size: "
-                    f"{len(self.sw_state.landmarks)}"
-                )
-
-                validate_landmarks(
-                self.sw_state,
-                self.view_set,
-                self.K,
-            )
-            
-            correspondences = find_pnp_correspondences(
-                self.sw_state,
-                current_view_id=frameID,
-            )
-
-            Rwc, C, inliers = solve_pnp(
-                correspondences,
-                self.K,
-            )
-            print("==============================\n") 
-
-            R_view, t_view = self.view_set.get_pose(frameID)
-
-            position_error = np.linalg.norm(C - t_view) 
-            rotation_error = np.degrees( np.arccos( np.clip( (np.trace(Rwc @ R_view.T) - 1) / 2, -1.0, 1.0, ) ) ) 
-            print("\n========== PnP vs ViewSet ==========") 
-            print(f"Position Error : {position_error:.4f} m") 
-            print(f"Rotation Error : {rotation_error:.3f} deg") 
-            print("====================================")
-            
-    # ------------------------------------------------------------------ #
-    #  Phase 1 helpers                                                     #
-    # ------------------------------------------------------------------ #
+                print(f"Map initialized")
 
     def _init_first_frame(self, img_frame, frameID):
         features  = self.feature_extractor.detect_initial_features(img_frame)
@@ -361,12 +305,49 @@ class VisualInertialOdometry():
         t_cw = -(R_cw @ t.ravel())
         return R_cw, t_cw
 
-    # ------------------------------------------------------------------ #
-    #  Phase 2 & 3 (stubs)                                                #
-    # ------------------------------------------------------------------ #
+
 
     def VI_alignment(self):
-        pass
+        candidates = find_triangulation_candidates(
+                    self.sw_state,
+                    self.view_set,
+                )
+
+        print(f"Found {len(candidates)} triangulation candidates")
+        triangulated = triangulate_candidates(
+            candidates,
+            self.view_set,
+            self.K,
+        )
+
+        print(f"Triangulated landmarks: {len(triangulated)}")
+
+        num_added = add_landmarks(
+            triangulated,
+            self.sw_state,
+        )
+
+        print(
+            f"Landmark database size: "
+            f"{len(self.sw_state.landmarks)}"
+        )
+
+        validate_landmarks(
+        self.sw_state,
+        self.view_set,
+        self.K,
+    )
+    
+    correspondences = find_pnp_correspondences(
+        self.sw_state,
+        current_view_id=frameID,
+    )
+
+    Rwc, C, inliers = solve_pnp(
+        correspondences,
+        self.K,
+    )
+
 
     def visual_inertial_optimization(self):
         pass
