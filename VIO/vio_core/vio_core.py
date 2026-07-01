@@ -13,10 +13,10 @@ from vio_core.triangulate import find_triangulation_candidates, triangulate_cand
 from vio_core.reprojection import validate_landmarks
 
 from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence, solve_pnp
-from optimization.factor_graph import FactorGraph
 from optimization.graph_builder import GraphBuilder
 from optimization.bundle_adjustment import BundleAdjuster
 from optimization.state_update import update_state_from_graph
+from optimization.median_depth import normalize_map
 
 
 class VisualInertialOdometry():
@@ -68,11 +68,9 @@ class VisualInertialOdometry():
 
         self.frameID = 0
 
-        self.factor_graph = FactorGraph(self.K)
-
         self.graph_builder = GraphBuilder()
 
-        self.bundle_adjustment = BundleAdjuster(self.factor_graph)
+        self.bundle_adjustment = None
 
 
     def vio_loop(self, raw_img_frame, timestamp):
@@ -259,16 +257,18 @@ class VisualInertialOdometry():
 
         new_points_added = self.run_triangulation()
 
-
-        # Build graph
-
-        self.graph_builder.update(
-            factor_graph=self.factor_graph,
+        #
+        # Build factor graph from current sliding window
+        #
+        factor_graph = self.graph_builder.build(
             view_set=self.view_set,
             sw_state=self.sw_state,
-            current_view_id=frameID,
+            K=self.K,
         )
-        self.factor_graph.print_summary()
+
+        factor_graph.print_summary()
+
+        self.bundle_adjustment = BundleAdjuster(factor_graph)
 
         if self.should_run_bundle_adjustment(frameID,new_points_added,):
             
@@ -278,16 +278,18 @@ class VisualInertialOdometry():
 
             if result is not None:
                 update_state_from_graph(
-                    self.factor_graph,
-                    self.view_set,
-                    self.sw_state,
-                )
+                            factor_graph,
+                            self.view_set,
+                            self.sw_state,
+                        )
+                scale = normalize_map(
+                            self.view_set,
+                            self.sw_state,
+                        )
 
             self.bundle_adjustment.clear_fixed_poses()
 
 
-        # Median depth estimation
-        #
         # IMU alignment
 
     def run_pnp(self, frameID):

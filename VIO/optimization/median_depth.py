@@ -93,3 +93,4 @@ def normalize_map(
     print(
         f"[VIO] Map normalized (scale = {scale:.6f})"
     )
+    return scale
