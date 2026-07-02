@@ -94,7 +94,7 @@ class VOFeatureVisualizer(Node):
             1,
             cv2.LINE_AA,
         )
-        print("Visualizer tracks:", len(active_tracks))
+
 
         img_msg = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')
         img_msg.header.stamp    = Time(seconds=timestamp).to_msg()

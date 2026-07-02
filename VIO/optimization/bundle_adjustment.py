@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
 
 
 class BundleAdjuster:
@@ -230,7 +231,7 @@ class BundleAdjuster:
             #
             # Reprojection error
             #
-            error = uv - factor.measurement
+            error = factor.measurement - uv
 
             #
             # Weight using information matrix
@@ -243,6 +244,44 @@ class BundleAdjuster:
             residuals,
             dtype=np.float64,
         )
+
+    def build_sparsity(self):
+        """
+        Build the Jacobian sparsity pattern for the current optimization
+        vector.
+
+        Each camera factor's 2 residual rows only depend on:
+          - the 6 pose columns of its view_id  (if that pose is optimized)
+          - the 3 landmark columns of its point_id
+
+        Everything else in that row is structurally zero. Handing this
+        pattern to least_squares() lets it use a sparse finite-difference
+        Jacobian instead of perturbing every one of the ~500 variables
+        for every one of the ~500 residuals on every iteration.
+
+        Returns
+        -------
+        scipy.sparse.lil_matrix, shape (n_residuals, n_variables)
+        """
+
+        n_vars = len(self.pose_index) * 6 + len(self.landmark_index) * 3
+        n_res  = len(self.graph.camera_factors) * 2
+
+        J = lil_matrix((n_res, n_vars), dtype=np.int8)
+
+        for i, factor in enumerate(self.graph.camera_factors):
+
+            row = i * 2
+
+            if factor.view_id in self.pose_index:
+                col = self.pose_index[factor.view_id]
+                J[row:row + 2, col:col + 6] = 1
+
+            if factor.point_id in self.landmark_index:
+                col = self.landmark_index[factor.point_id]
+                J[row:row + 2, col:col + 3] = 1
+
+        return J
 
     def optimize(
         self,
@@ -274,6 +313,12 @@ class BundleAdjuster:
         print(f"Residuals : {len(self.compute_residuals(x0))}")
 
         #
+        # Sparsity pattern — lets scipy use a sparse finite-difference
+        # Jacobian instead of a dense one over all variables.
+        #
+        sparsity = self.build_sparsity()
+
+        #
         # Nonlinear least squares
         #
         result = least_squares(
@@ -281,6 +326,7 @@ class BundleAdjuster:
             x0=x0,
             method="trf",
             loss="huber",
+            jac_sparsity=sparsity,
             verbose=2,
             max_nfev=max_iterations,
         )

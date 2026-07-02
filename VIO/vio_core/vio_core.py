@@ -212,7 +212,6 @@ class VisualInertialOdometry():
         )
         valid_idx = status.astype(bool)   # same length as prev_points
 
-        print("status valid:", np.count_nonzero(valid_idx))
 
         # Pass full, unfiltered arrays — sliding_window does its own
         # v1 = valid_idx & ps_idx filtering internally.
@@ -264,10 +263,6 @@ class VisualInertialOdometry():
                 and len(self.sw_state.sliding_window_view_ids) > 0
                 and removed_frame_id > self.sw_state.sliding_window_view_ids[0]):
             self.removed_frame_ids.append(removed_frame_id)
-            print("--------------------------------")
-            print("Frame:", frameID)
-            print("Tracked after update:", len(self.sw_state.all_ids[frameID]))
-            print("Unique IDs:", len(np.unique(self.sw_state.all_ids[frameID][:,1])))
 
         # ── detect new features in sparse grid cells ──────────────────────
         new_pts = self.feature_extractor.extract_features_in_empty_cells(
@@ -343,6 +338,21 @@ class VisualInertialOdometry():
         success = self._initialise_map(frameID, timestamp)
 
         if success:
+            candidates = find_triangulation_candidates(
+                self.sw_state,
+                self.view_set,
+            )
+
+            triangulated = triangulate_candidates(
+                candidates,
+                self.view_set,
+                self.K,
+            )
+
+            add_landmarks(
+                triangulated,
+                self.sw_state,
+            )
 
             self.isMapInitialized = True
 
@@ -405,12 +415,17 @@ class VisualInertialOdometry():
         return R_cw, t_cw
 
     def VI_alignment(self, window_state, frameID, timestamp):
+        print("Current observations:", len(self.sw_state.all_ids[frameID]))
+        print("Landmarks:", len(self.sw_state.landmarks))
 
-        if not self.run_pnp(
-                frameID,
-                timestamp,
-            ):
+        success = self.run_pnp(frameID, timestamp)
+
+        if not success:
+            print("PnP failed. Skipping triangulation.")
             return
+
+        new_points_added = self.run_triangulation()
+        print("running triangulation")
         
 
         new_points_added = self.run_triangulation()

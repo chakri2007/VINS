@@ -29,6 +29,11 @@ class CameraFactor:
         default_factory=lambda: np.eye(2)
     )
 
+    def __post_init__(self):
+        self.sqrt_information = np.linalg.cholesky(
+            self.information
+        )
+
     def project(
         self,
         R: np.ndarray,
