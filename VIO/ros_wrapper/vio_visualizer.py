@@ -56,7 +56,7 @@ class VOFeatureVisualizer(Node):
             vis = raw_frame.copy()
 
         # Undistort for clean visualisation (same K used throughout).
-        vis = cv2.undistort(vis, K, distortion_coeffs)
+        #vis = cv2.undistort(vis, K, distortion_coeffs)
 
         for feature_id, point_history in active_tracks.items():
             if len(point_history) == 0:
@@ -71,15 +71,15 @@ class VOFeatureVisualizer(Node):
                 # New detection — green dot.
                 cv2.circle(vis, current_pt, 4, (0, 255, 0), -1)
             else:
+                cv2.circle(vis, current_pt, 4, (255, 0, 0), -1)
                 # Tracked point — draw trail then blue dot on top.
                 for i in range(len(point_history) - 1):
                     _, u1, v1 = point_history[i]
                     _, u2, v2 = point_history[i + 1]
                     pt_a = (int(round(u1)), int(round(v1)))
                     pt_b = (int(round(u2)), int(round(v2)))
-                    cv2.line(vis, pt_a, pt_b, (0, 255, 255), 1)   # yellow trail
+                    cv2.line(vis, pt_a, pt_b, (0, 255, 255), 1)
 
-                cv2.circle(vis, current_pt, 4, (255, 0, 0), -1)   # blue current pos
 
         # Overlay a small status string so it's easy to see in RViz.
         n_tracked = sum(1 for ph in active_tracks.values() if len(ph) > 1)
