@@ -299,6 +299,8 @@ class VisualInertialOdometry():
     
     def get_active_tracks(self) -> dict:
         """Build track history for every point visible in the active sliding window."""
+        print("Window IDs:", self.sw_state.sliding_window_view_ids)
+        print("Window length:", len(self.sw_state.sliding_window_view_ids))
         tracks = {}
         for view_id in self.sw_state.sliding_window_view_ids:
             obs = self.sw_state.all_observations.get(view_id)
