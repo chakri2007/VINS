@@ -58,7 +58,7 @@ class VisualInertialOdometry():
             'initialOptimizationFrames': 250,
         }
 
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
         self.view_set          = ViewSet()
         self.sw_state          = SlidingWindowState(window_size=21)
         self.prev_img_frame    = None
