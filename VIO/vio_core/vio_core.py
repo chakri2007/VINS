@@ -497,6 +497,7 @@ class VisualInertialOdometry():
             self.view_set,
             self.K,
         )
+        print(f"Triangulation: {num_added} new landmarks added.")
 
         return num_added > 0
 

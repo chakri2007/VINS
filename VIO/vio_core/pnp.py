@@ -76,10 +76,10 @@ def find_pnp_correspondences(
         f"Current features={len(ids)} | "
         f"Landmark matches={len(correspondences)}"
     )
-    print("\n========== PnP CORRESPONDENCES ==========")
-    print(f"Current View : {current_view_id}")
-    print(f"Tracked Features : {len(ids)}")
-    print(f"3D Matches : {len(correspondences)}")
+    # print("\n========== PnP CORRESPONDENCES ==========")
+    # print(f"Current View : {current_view_id}")
+    # print(f"Tracked Features : {len(ids)}")
+    # print(f"3D Matches : {len(correspondences)}")
 
     for c in correspondences[:10]:
         print(
