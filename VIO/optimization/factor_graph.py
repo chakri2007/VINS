@@ -87,3 +87,7 @@ class FactorGraph:
     def update_landmark(self, point_id, xyz):
 
         self.landmark_nodes[point_id] = xyz.copy()
+
+    def add_imu_factor(self, factor):
+
+        self.imu_factors.append(factor)

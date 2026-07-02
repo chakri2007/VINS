@@ -23,25 +23,7 @@ from vio_core.ransac import estimate_fundamental_matrix_ransac
 from typing import Dict, Tuple
 
 from vio_core.landmarks import Landmark
-
-@dataclass
-class Landmark:
-    """
-    A reconstructed 3D landmark.
-
-    One Landmark corresponds to one feature point ID that has been
-    triangulated into 3D.
-    """
-
-    point_id: int
-
-    xyz: np.ndarray
-
-    first_view: int
-
-    observations: list = field(default_factory=list)
-
-    is_triangulated: bool = True
+from imu.imu_measurement import IMUMeasurement
 
 
 @dataclass
@@ -78,6 +60,20 @@ class SlidingWindowState:
     current_view_id: int = -1
 
     no_movement_at_start: bool = True
+
+    # ------------------------------------------------------------------
+    # IMU measurements
+    #
+    # key:
+    #     (from_view, to_view)
+    #
+    # value:
+    #     list[IMUMeasurement]
+    # ------------------------------------------------------------------
+
+    imu_measurements: Dict[tuple[int, int], list[IMUMeasurement]] = field(
+        default_factory=dict
+    )
 
 
 def _within_image(points: np.ndarray, image_shape) -> np.ndarray:
@@ -277,4 +273,45 @@ def update_sliding_window(
             # current_sliding_window_index unchanged — still window_size
             window_state["isEnoughParallax"] = True
 
+    #
+    # Remove IMU data associated with frames that left the window
+    #
+    if removed_frame_id >= 0:
+
+        keys_to_remove = []
+
+        for key in list(state.imu_measurements):
+
+            if removed_frame_id in key:
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            del state.imu_measurements[key]
+
     return removed_frame_id, window_state
+
+def add_imu_measurements(
+    state: SlidingWindowState,
+    from_view: int,
+    to_view: int,
+    measurements,
+):
+    """
+    Store all IMU samples between two consecutive views.
+    """
+
+    state.imu_measurements[(from_view, to_view)] = list(measurements)
+
+def get_imu_measurements(
+    state: SlidingWindowState,
+    from_view: int,
+    to_view: int,
+):
+    """
+    Return IMU samples between two views.
+    """
+
+    return state.imu_measurements.get(
+        (from_view, to_view),
+        [],
+    )
