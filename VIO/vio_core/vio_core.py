@@ -297,8 +297,9 @@ class VisualInertialOdometry():
 
         return window_state
     
-    def get_active_tracks(self) -> dict:
-        """Build track history for every point still alive in the current frame."""
+    def get_active_tracks(self, max_history_length: int = 10) -> dict:
+        """Build track history for every point still alive in the current frame,
+        capped to the most recent `max_history_length` observations."""
         current_id = self.frameID
         current_ids = self.sw_state.all_ids.get(current_id)
         if current_ids is None or len(current_ids) == 0:
@@ -314,10 +315,16 @@ class VisualInertialOdometry():
             for point_id, (u, v) in zip(ids[:, 1], obs):
                 pid = int(point_id)
                 if pid not in alive_ids:
-                    continue          # dropped this frame — don't draw it
+                    continue
                 tracks.setdefault(pid, []).append((view_id, float(u), float(v)))
+
+        # keep only the most recent `max_history_length` points of each trail
+        for pid, hist in tracks.items():
+            if len(hist) > max_history_length:
+                tracks[pid] = hist[-max_history_length:]
+
         return tracks
-    
+
     def vio_initialization(self, window_state, frameID, timestamp):
 
         if window_state["isFirstFewViews"]:
