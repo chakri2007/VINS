@@ -211,6 +211,8 @@ class VisualInertialOdometry():
         )
         valid_idx = status.astype(bool)   # same length as prev_points
 
+        print("status valid:", np.count_nonzero(valid_idx))
+
         # Pass full, unfiltered arrays — sliding_window does its own
         # v1 = valid_idx & ps_idx filtering internally.
         removed_frame_id, window_state = update_sliding_window(
@@ -261,6 +263,10 @@ class VisualInertialOdometry():
                 and len(self.sw_state.sliding_window_view_ids) > 0
                 and removed_frame_id > self.sw_state.sliding_window_view_ids[0]):
             self.removed_frame_ids.append(removed_frame_id)
+            print("--------------------------------")
+            print("Frame:", frameID)
+            print("Tracked after update:", len(self.sw_state.all_ids[frameID]))
+            print("Unique IDs:", len(np.unique(self.sw_state.all_ids[frameID][:,1])))
 
         # ── detect new features in sparse grid cells ──────────────────────
         new_pts = self.feature_extractor.extract_features_in_empty_cells(
