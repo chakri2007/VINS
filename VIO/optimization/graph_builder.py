@@ -3,7 +3,7 @@ from optimization.camera_factor import CameraFactor
 import numpy as np
 from optimization.imu_factor import IMUFactor
 
-from imu.preintegration import preintegrate_imu
+from imu.preintegration import IMUPreintegrator
 
 from memory_management.sliding_window import get_imu_measurements
 
@@ -13,6 +13,7 @@ class GraphBuilder:
 
         self.information = np.eye(2)
         self.imu_information = np.eye(9)
+        self.imu_preintegrator = IMUPreintegrator()
 
     def build(
         self,
@@ -111,7 +112,7 @@ class GraphBuilder:
             if len(measurements) == 0:
                 continue
 
-            preintegration = preintegrate_imu(
+            preintegration = self.imu_preintegrator(
                 measurements,
             )
 

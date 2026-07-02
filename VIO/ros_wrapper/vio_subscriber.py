@@ -14,7 +14,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from VIO.vio_core.vio_core_tested import VisualInertialOdometry
+from vio_core.vio_core import VisualInertialOdometry
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
 
 
