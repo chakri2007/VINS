@@ -91,6 +91,7 @@ class VisualInertialOdometry():
             self._init_first_frame(
                 self.img_frame,
                 self.frameID,
+                timestamp,
             )
             return
 
