@@ -111,7 +111,7 @@ class ViewSet:
 
         Mirrors MATLAB: poses(vSet, viewId).AbsolutePose
         """
-        if view_id not in self._poses:
+        if view_id not in self._views:
             raise KeyError(f"View id {view_id} not found in ViewSet.")
         view = self._views[view_id]
 
@@ -150,9 +150,10 @@ class ViewSet:
         K must be (3,3).
         """
         R, t = self.get_pose(view_id)
-        Rt = R.T                          # world-to-camera rotation
-        tt = -(Rt @ t).reshape(3, 1)      # world-to-camera translation
-        return K @ np.hstack([Rt, tt])    # (3,4)
+        Rt = R.T
+        tt = -Rt @ t[:, None]
+
+        return K @ np.hstack((Rt, tt))
     
     def get_projection_matrices(
         self,
