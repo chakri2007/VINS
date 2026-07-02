@@ -298,9 +298,13 @@ class VisualInertialOdometry():
         return window_state
     
     def get_active_tracks(self) -> dict:
-        """Build track history for every point visible in the active sliding window."""
-        print("Window IDs:", self.sw_state.sliding_window_view_ids)
-        print("Window length:", len(self.sw_state.sliding_window_view_ids))
+        """Build track history for every point still alive in the current frame."""
+        current_id = self.frameID
+        current_ids = self.sw_state.all_ids.get(current_id)
+        if current_ids is None or len(current_ids) == 0:
+            return {}
+        alive_ids = set(int(pid) for pid in current_ids[:, 1])
+
         tracks = {}
         for view_id in self.sw_state.sliding_window_view_ids:
             obs = self.sw_state.all_observations.get(view_id)
@@ -308,9 +312,10 @@ class VisualInertialOdometry():
             if obs is None or ids is None or len(obs) == 0:
                 continue
             for point_id, (u, v) in zip(ids[:, 1], obs):
-                tracks.setdefault(int(point_id), []).append(
-                    (view_id, float(u), float(v))
-                )
+                pid = int(point_id)
+                if pid not in alive_ids:
+                    continue          # dropped this frame — don't draw it
+                tracks.setdefault(pid, []).append((view_id, float(u), float(v)))
         return tracks
     
     def vio_initialization(self, window_state, frameID, timestamp):
