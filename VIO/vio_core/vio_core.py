@@ -134,6 +134,40 @@ class VisualInertialOdometry():
             'K':      self.K,
             'D':      self.distortion_coeffs,
         }
+    
+    def _init_first_frame(self, img_frame, frameID, timestamp):
+        features  = self.feature_extractor.detect_initial_features(img_frame)
+        num_pts   = len(features)
+        point_ids = np.arange(1, num_pts + 1)
+
+        self.sw_state.all_observations[frameID]  = features
+        self.sw_state.all_ids[frameID]           = np.column_stack(
+            [np.full(num_pts, frameID), point_ids]
+        )
+        self.sw_state.all_triangulated[frameID]  = np.zeros(num_pts, dtype=bool)
+        self.sw_state.is_key_frame[frameID]      = True
+        for pid in point_ids:
+            self.sw_state.key_point_track_count[pid] = 1
+
+        # update_sliding_window first-frame branch just registers the view_id
+        # and sets current_view_id = frameID.
+        update_sliding_window(
+            state               = self.sw_state,
+            image_shape         = img_frame.shape,
+            curr_points_tracked = features,
+            valid_idx           = np.ones(num_pts, dtype=bool),
+            view_id             = frameID,
+            F_loop              = self.params['F_loop'],
+            F_iterations        = self.params['F_Iterations'],
+            F_confidence        = self.params['F_Confidence'],
+            F_threshold         = self.params['F_Threshold'],
+            key_frame_parallax  = self.params['keyFrameParallax'],
+        )
+
+        self.prev_img_frame  = img_frame
+        self.first_img_frame = img_frame
+        self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3), timestamp=timestamp)
+        self.isFirstFrame = False
 
     def process_frontend(self, img_frame, frameID):
         prev_stored_id = self.sw_state.current_view_id
