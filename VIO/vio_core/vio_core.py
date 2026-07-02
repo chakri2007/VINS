@@ -105,12 +105,13 @@ class VisualInertialOdometry():
 
         self.previous_image_view_id = self.frameID
 
-        self.img_frame, self.K = preprocess_image(
-            raw_img_frame,
-            self.distortion_coeffs,
-            self.K_raw,
-            self.params,
-        )
+        # self.img_frame, self.K = preprocess_image(
+        #     raw_img_frame,
+        #     self.distortion_coeffs,
+        #     self.K_raw,
+        #     self.params,
+        # 
+        self.img_frame = raw_img_frame.copy()
 
         #
         # First frame
@@ -299,31 +300,29 @@ class VisualInertialOdometry():
     
     def get_active_tracks(self, max_history_length: int = 10) -> dict:
         """Build track history for every point still alive in the current frame,
-        capped to the most recent `max_history_length` observations."""
+        using the last `max_history_length` RAW frames (not the sparse keyframe
+        list in sliding_window_view_ids), so each trail is a dense, smooth
+        sequence of small per-frame steps instead of jumping keyframe-to-keyframe."""
         current_id = self.frameID
         current_ids = self.sw_state.all_ids.get(current_id)
         if current_ids is None or len(current_ids) == 0:
             return {}
         alive_ids = set(int(pid) for pid in current_ids[:, 1])
 
-        tracks = {}
-        for view_id in self.sw_state.sliding_window_view_ids:
+        tracks = {pid: [] for pid in alive_ids}
+        start_id = max(1, current_id - max_history_length + 1)
+
+        for view_id in range(start_id, current_id + 1):
             obs = self.sw_state.all_observations.get(view_id)
             ids = self.sw_state.all_ids.get(view_id)
             if obs is None or ids is None or len(obs) == 0:
                 continue
             for point_id, (u, v) in zip(ids[:, 1], obs):
                 pid = int(point_id)
-                if pid not in alive_ids:
-                    continue
-                tracks.setdefault(pid, []).append((view_id, float(u), float(v)))
+                if pid in tracks:
+                    tracks[pid].append((view_id, float(u), float(v)))
 
-        # keep only the most recent `max_history_length` points of each trail
-        for pid, hist in tracks.items():
-            if len(hist) > max_history_length:
-                tracks[pid] = hist[-max_history_length:]
-
-        return tracks
+        return {pid: hist for pid, hist in tracks.items() if hist}
 
     def vio_initialization(self, window_state, frameID, timestamp):
 
