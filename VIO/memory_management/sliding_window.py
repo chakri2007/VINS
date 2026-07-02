@@ -288,7 +288,18 @@ def update_sliding_window(
         for key in keys_to_remove:
             del state.imu_measurements[key]
 
-    return removed_frame_id, window_state
+    #
+    # Remove feature observations belonging to frames
+    # that left the sliding window
+    #
+    if removed_frame_id >= 0:
+
+        state.all_observations.pop(removed_frame_id, None)
+        state.all_ids.pop(removed_frame_id, None)
+        state.all_triangulated.pop(removed_frame_id, None)
+        state.is_key_frame.pop(removed_frame_id, None)
+
+        return removed_frame_id, window_state
 
 def add_imu_measurements(
     state: SlidingWindowState,
