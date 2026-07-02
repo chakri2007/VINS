@@ -321,7 +321,7 @@ class VisualInertialOdometry():
         if not window_state["isEnoughParallax"]:
             return
 
-        success = self._initialise_map(frameID)
+        success = self._initialise_map(frameID, timestamp)
 
         if success:
 
@@ -330,7 +330,7 @@ class VisualInertialOdometry():
             print("Map initialized.")
 
     
-    def _initialise_map(self, frameID) -> bool:
+    def _initialise_map(self, frameID, timestamp) -> bool:
         sw_ids = self.sw_state.sliding_window_view_ids
         if len(sw_ids) < 2:
             return False
@@ -370,7 +370,7 @@ class VisualInertialOdometry():
         if R is None:
             return False
 
-        self.view_set.add_view(view_id=frameID, R=R, t=t)
+        self.view_set.add_view(view_id=frameID, R=R, t=t, timestamp=timestamp)
         return True
     
     def _estimate_relative_pose(self, F, pts1, pts2):
