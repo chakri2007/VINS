@@ -329,6 +329,62 @@ class VisualInertialOdometry():
 
             print("Map initialized.")
 
+    
+    def _initialise_map(self, frameID) -> bool:
+        sw_ids = self.sw_state.sliding_window_view_ids
+        if len(sw_ids) < 2:
+            return False
+
+        id1, id2 = sw_ids[-2], sw_ids[-1]
+        ids1 = self.sw_state.all_ids.get(id1)
+        ids2 = self.sw_state.all_ids.get(id2)
+        if ids1 is None or ids2 is None or len(ids1) < 8 or len(ids2) < 8:
+            return False
+
+        _, ia, ib = np.intersect1d(ids1[:, 1], ids2[:, 1], return_indices=True)
+        if len(ia) < 8:
+            return False
+
+        matches1 = self.sw_state.all_observations[id1][ia]
+        matches2 = self.sw_state.all_observations[id2][ib]
+
+        best_F, best_inliers = None, None
+        for _ in range(10):
+            F, inliers = estimate_fundamental_matrix_ransac(
+                matches1, matches2,
+                num_trials     = self.params['F_Iterations'],
+                confidence     = self.params['F_Confidence'],
+                dist_threshold = self.params['F_Threshold'],
+            )
+            if F is None:
+                continue
+            if best_inliers is None or np.count_nonzero(inliers) > np.count_nonzero(best_inliers):
+                best_F, best_inliers = F, inliers
+
+        if best_F is None or np.count_nonzero(best_inliers) < 8:
+            return False
+
+        R, t = self._estimate_relative_pose(
+            best_F, matches1[best_inliers], matches2[best_inliers]
+        )
+        if R is None:
+            return False
+
+        self.view_set.add_view(view_id=frameID, R=R, t=t)
+        return True
+    
+    def _estimate_relative_pose(self, F, pts1, pts2):
+        E = self.K.T @ F @ self.K
+        n_in, R, t, _ = cv2.recoverPose(
+            E, pts1.astype(np.float64), pts2.astype(np.float64), self.K
+        )
+        if n_in < 8:
+            return None, None
+        # cv2 returns world-to-camera; invert to camera-to-world (MATLAB convention)
+        R_cw = R.T
+        t_cw = -(R_cw @ t.ravel())
+        return R_cw, t_cw
+
     def VI_alignment(self, window_state, frameID, timestamp):
 
         if not self.run_pnp(
