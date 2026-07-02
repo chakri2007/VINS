@@ -475,10 +475,18 @@ class VisualInertialOdometry():
         if len(correspondences) < 6:
             return False
 
-        Rwc, C, inliers = solve_pnp(
+        result = solve_pnp(
             correspondences,
             self.K,
         )
+
+        if result is None:
+            return False
+
+        Rwc, C, inliers = result
+
+        if inliers is None or len(inliers) == 0:
+            return False
 
         self.view_set.add_view(
             frameID,
@@ -486,6 +494,14 @@ class VisualInertialOdometry():
             C,
             timestamp,
         )
+
+        # Register this frame's observation on every landmark that
+        # survived PnP RANSAC as an inlier — this is what keeps the
+        # factor graph growing frame over frame.
+        for idx in inliers.flatten():
+            c = correspondences[int(idx)]
+            landmark = self.sw_state.landmarks[c.point_id]
+            landmark.add_observation(frameID, c.uv)
 
         return True
     
