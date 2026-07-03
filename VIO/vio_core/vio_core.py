@@ -54,8 +54,14 @@ class VisualInertialOdometry():
             'F_Threshold':      4,
             'keyFrameParallax': 50,
 
-            'optimizationFrequency': 10,
-            'initialOptimizationFrames': 250,
+            # VINS-Mono style: BA is triggered by keyframe insertion (see
+            # should_run_bundle_adjustment), not by frame count / a fixed
+            # frequency, so those knobs are gone. What's left is a one-shot
+            # solver time budget for the vision-only window BA — VINS-Mono
+            # uses 0.2s for its init BA, a looser cap than steady-state
+            # (0.04s) since this only runs once per keyframe, not every
+            # frame, and is shielded from the sensor stream.
+            'baMaxSolverTimeSeconds': 0.2,
         }
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
@@ -426,9 +432,6 @@ class VisualInertialOdometry():
 
         new_points_added = self.run_triangulation()
         print("running triangulation")
-        
-
-        new_points_added = self.run_triangulation()
 
         #
         # Build factor graph from current sliding window
@@ -441,10 +444,13 @@ class VisualInertialOdometry():
 
         factor_graph.print_summary()
 
-        self.bundle_adjustment = BundleAdjuster(factor_graph)
+        self.bundle_adjustment = BundleAdjuster(
+            factor_graph,
+            max_solver_time_in_seconds=self.params['baMaxSolverTimeSeconds'],
+        )
 
-        if self.should_run_bundle_adjustment(frameID,new_points_added,):
-            
+        if self.should_run_bundle_adjustment(window_state):
+
             self.fix_bundle_adjustment_poses(window_state)
 
             result = self.bundle_adjustment.optimize()
@@ -532,36 +538,47 @@ class VisualInertialOdometry():
 
         return num_added > 0
 
-    def should_run_bundle_adjustment(
-        self,
-        frameID,
-        new_points_added,):
+    def should_run_bundle_adjustment(self, window_state):
+        """
+        VINS-Mono only runs its vision-only window BA when a new keyframe
+        has actually been accepted into the window (relativePose()'s
+        >30-correspondence / >20px-parallax gate deciding there's enough
+        motion to be worth optimizing) — not on a fixed frame-count/
+        frequency schedule, and not just because a few new points got
+        triangulated on an otherwise-redundant frame. `isEnoughParallax`
+        is this codebase's equivalent of that keyframe-acceptance signal
+        (see update_sliding_window), so it's the trigger here too.
+        """
+        return bool(window_state.get("isEnoughParallax", False))
 
-        if frameID < self.params["initialOptimizationFrames"]:
-            return True
-
-        if frameID % self.params["optimizationFrequency"] == 0:
-            return True
-
-        if new_points_added:
-            return True
-
-        return False
-    
     def fix_bundle_adjustment_poses(self, window_state):
+        """
+        VINS-Mono GlobalSFM-style minimal gauge fixing: vision-only SfM over
+        a window has 7 unobservable DOF (6 gauge + 1 scale). GlobalSFM::
+        construct() removes exactly those by fully fixing the reference
+        frame l's pose and fixing only the newest frame's translation (its
+        rotation stays free) — the distance between those two fixed camera
+        centers is what pins absolute scale. Fixing a whole chunk of poses,
+        as the old code did, over-constrains the problem for no benefit.
+        """
 
         sw_ids = list(self.sw_state.sliding_window_view_ids)
 
         self.bundle_adjustment.clear_fixed_poses()
 
-        if window_state["isWindowFull"]:
+        if len(sw_ids) == 0:
+            return
 
-            for view_id in sw_ids[:11]:
-                self.bundle_adjustment.fix_pose(view_id)
-
-        else:
-
+        if len(sw_ids) == 1:
+            # Nothing to triangulate a baseline against yet — just anchor
+            # the one pose we have.
             self.bundle_adjustment.fix_pose(sw_ids[0])
+            return
+
+        # oldest (reference) frame: fully fixed
+        self.bundle_adjustment.fix_pose(sw_ids[0])
+        # newest frame: translation only, rotation stays free
+        self.bundle_adjustment.fix_pose_translation(sw_ids[-1])
 
     def process_imu(
         self,

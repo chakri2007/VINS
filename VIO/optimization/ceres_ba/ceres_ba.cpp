@@ -120,7 +120,17 @@ py::dict solve_bundle_adjustment(
     int max_iterations,
     bool verbose,
     double huber_delta,
-    int num_threads
+    int num_threads,
+    // VINS-Mono GlobalSFM-style minimal gauge fixing: poses in this list
+    // only have their TRANSLATION (camera center) block held constant,
+    // rotation stays free. Used to fix just the newest frame's translation
+    // (the other 6 DOF come from fully fixing the reference frame via
+    // fixed_pose_ids), which is what pins absolute scale without over-
+    // constraining the rest of the window.
+    std::vector<int> fixed_translation_only_pose_ids,
+    // Bounded one-shot solver budget (VINS-Mono init BA: 0.2s). <= 0 means
+    // "no cap", i.e. run until max_iterations/convergence like before.
+    double max_solver_time_in_seconds
 ) {
     double fx = K_vec[0], fy = K_vec[1], cx = K_vec[2], cy = K_vec[3];
 
@@ -173,6 +183,16 @@ py::dict solve_bundle_adjustment(
         }
     }
 
+    // Translation-only gauge fix — rotation block for these poses is left
+    // free even though the camera center is pinned.
+    for (int vid : fixed_translation_only_pose_ids) {
+        auto it = poses.find(vid);
+        if (it == poses.end()) continue;
+        if (problem.HasParameterBlock(it->second.data() + 3)) {
+            problem.SetParameterBlockConstant(it->second.data() + 3);
+        }
+    }
+
     ceres::Solver::Options options;
 
     // SPARSE_SCHUR is the standard BA linear solver: eliminate landmarks
@@ -187,6 +207,9 @@ py::dict solve_bundle_adjustment(
     options.minimizer_progress_to_stdout = verbose;
     options.max_num_iterations           = max_iterations;
     options.num_threads                  = num_threads;
+    if (max_solver_time_in_seconds > 0.0) {
+        options.max_solver_time_in_seconds = max_solver_time_in_seconds;
+    }
 
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
@@ -249,6 +272,8 @@ PYBIND11_MODULE(ceres_ba, m) {
         py::arg("max_iterations") = 100,
         py::arg("verbose") = false,
         py::arg("huber_delta") = 1.0,
-        py::arg("num_threads") = 4
+        py::arg("num_threads") = 4,
+        py::arg("fixed_translation_only_pose_ids") = std::vector<int>{},
+        py::arg("max_solver_time_in_seconds") = -1.0
     );
 }

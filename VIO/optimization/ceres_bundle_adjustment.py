@@ -35,25 +35,51 @@ class CeresResult:
 
 class CeresBundleAdjuster:
 
-    def __init__(self, factor_graph, num_threads=4, huber_delta=1.0):
+    def __init__(self, factor_graph, num_threads=4, huber_delta=1.0,
+                 max_solver_time_in_seconds=None):
 
         self.graph = factor_graph
         self.fixed_pose_ids = set()
+        # VINS-Mono GlobalSFM-style minimal gauge fix: poses here only have
+        # their translation (camera center) held constant, rotation is free.
+        self.fixed_translation_only_pose_ids = set()
         self.num_threads = num_threads
         self.huber_delta = huber_delta
+        # Bounded one-shot solver budget, e.g. 0.2s for the vision-only
+        # init/window BA (VINS-Mono's max_solver_time_in_seconds). None/<=0
+        # means unbounded (run to max_iterations/convergence).
+        self.max_solver_time_in_seconds = max_solver_time_in_seconds
 
     # ------------------------------------------------------------ #
     # Fixed-pose bookkeeping (same as BundleAdjuster)
     # ------------------------------------------------------------ #
 
     def fix_pose(self, view_id):
+        """Fully fix a pose (rotation + translation)."""
         self.fixed_pose_ids.add(view_id)
+        self.fixed_translation_only_pose_ids.discard(view_id)
+
+    def fix_pose_translation(self, view_id):
+        """
+        Fix only the translation (camera center) of a pose, leaving its
+        rotation free. This is what VINS-Mono's GlobalSFM::construct() does
+        to the newest frame in the window: combined with fully fixing the
+        reference frame l, it removes exactly the 7 unobservable DOF
+        (6 gauge + 1 scale) of vision-only SfM without over-constraining
+        every other pose in the window.
+        """
+        if view_id in self.fixed_pose_ids:
+            # already fully fixed — translation-only would be redundant
+            return
+        self.fixed_translation_only_pose_ids.add(view_id)
 
     def unfix_pose(self, view_id):
         self.fixed_pose_ids.discard(view_id)
+        self.fixed_translation_only_pose_ids.discard(view_id)
 
     def clear_fixed_poses(self):
         self.fixed_pose_ids.clear()
+        self.fixed_translation_only_pose_ids.clear()
 
     # ------------------------------------------------------------ #
     # Pack / unpack helpers
@@ -145,11 +171,18 @@ class CeresBundleAdjuster:
         K_vec = [float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])]
 
         fixed_ids = [int(v) for v in self.fixed_pose_ids if v in poses]
+        fixed_translation_only_ids = [
+            int(v) for v in self.fixed_translation_only_pose_ids if v in poses
+        ]
+        solver_time_cap = self.max_solver_time_in_seconds or -1.0
 
         print("\n========== BUNDLE ADJUSTMENT (Ceres) ==========")
-        print(f"Poses         : {len(poses)}  (fixed: {len(fixed_ids)})")
+        print(f"Poses         : {len(poses)}  (fixed: {len(fixed_ids)}, "
+              f"translation-only fixed: {len(fixed_translation_only_ids)})")
         print(f"Landmarks     : {len(points)}")
         print(f"Observations  : {len(observations)}")
+        if solver_time_cap > 0:
+            print(f"Solver cap    : {solver_time_cap:.3f}s")
 
         result = ceres_ba.solve_bundle_adjustment(
             poses=poses,
@@ -161,6 +194,8 @@ class CeresBundleAdjuster:
             verbose=verbose,
             huber_delta=self.huber_delta,
             num_threads=self.num_threads,
+            fixed_translation_only_pose_ids=fixed_translation_only_ids,
+            max_solver_time_in_seconds=solver_time_cap,
         )
 
         print(f"Cost          : {result['initial_cost']:.4f} -> {result['final_cost']:.4f}")
