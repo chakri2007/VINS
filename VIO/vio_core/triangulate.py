@@ -97,12 +97,12 @@ def find_triangulation_candidates(
             )
         )
 
-    print(
-        f"[Triangulation] "
-        f"{view1} -> {view2} | "
-        f"Shared={len(common_ids)} | "
-        f"Candidates={len(candidates)}"
-    )
+    # print(
+    #     f"[Triangulation] "
+    #     f"{view1} -> {view2} | "
+    #     f"Shared={len(common_ids)} | "
+    #     f"Candidates={len(candidates)}"
+    # )
 
     return candidates
 def triangulate_candidates(
