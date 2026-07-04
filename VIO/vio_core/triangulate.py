@@ -239,40 +239,40 @@ def triangulate_candidates(
             )
         )
 
-    print("\n========== TRIANGULATION SUMMARY ==========")
-    print(f"Input candidates      : {len(candidates)}")
-    print(f"Accepted              : {len(triangulated)}")
-    print(f"Rejected (cheirality) : {cheirality_rejected}")
-    print(f"Rejected (angle)      : {angle_rejected}")
-    print("===========================================\n")
+    # print("\n========== TRIANGULATION SUMMARY ==========")
+    # print(f"Input candidates      : {len(candidates)}")
+    # print(f"Accepted              : {len(triangulated)}")
+    # print(f"Rejected (cheirality) : {cheirality_rejected}")
+    # print(f"Rejected (angle)      : {angle_rejected}")
+    # print("===========================================\n")
 
     if len(depths):
 
-        print(
-            "[Triangulation] "
-            f"Depth(min={np.min(depths):.2f}, "
-            f"median={np.median(depths):.2f}, "
-            f"max={np.max(depths):.2f})"
-        )
-        print(
-            "[Triangulation] "
-            f"Angle(min={np.min(angles):.2f}°, "
-            f"median={np.median(angles):.2f}°, "
-            f"mean={np.mean(angles):.2f}°, "
-            f"max={np.max(angles):.2f}°)"
-        )
+        # print(
+        #     "[Triangulation] "
+        #     f"Depth(min={np.min(depths):.2f}, "
+        #     f"median={np.median(depths):.2f}, "
+        #     f"max={np.max(depths):.2f})"
+        # )
+        # print(
+        #     "[Triangulation] "
+        #     f"Angle(min={np.min(angles):.2f}°, "
+        #     f"median={np.median(angles):.2f}°, "
+        #     f"mean={np.mean(angles):.2f}°, "
+        #     f"max={np.max(angles):.2f}°)"
+        # )
 
         depth_angle_pairs.sort(key=lambda x: x[0])
 
-        print("\n========== DEEPEST LANDMARKS ==========")
+        # print("\n========== DEEPEST LANDMARKS ==========")
 
-        for depth, angle in depth_angle_pairs[-10:]:
-            print(
-                f"Depth = {depth:8.2f} m    "
-                f"Angle = {angle:5.2f}°"
-            )
+        # for depth, angle in depth_angle_pairs[-10:]:
+        #     print(
+        #         f"Depth = {depth:8.2f} m    "
+        #         f"Angle = {angle:5.2f}°"
+        #     )
 
-        print("=======================================\n")
+        # print("=======================================\n")
 
     return triangulated
 

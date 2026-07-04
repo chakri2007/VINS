@@ -81,14 +81,14 @@ def find_pnp_correspondences(
     # print(f"Tracked Features : {len(ids)}")
     # print(f"3D Matches : {len(correspondences)}")
 
-    for c in correspondences[:10]:
-        print(
-            f"ID={c.point_id:4d} "
-            f"XYZ={np.round(c.xyz,2)} "
-            f"UV={np.round(c.uv,1)}"
-        )
+    # for c in correspondences[:10]:
+    #     print(
+    #         f"ID={c.point_id:4d} "
+    #         f"XYZ={np.round(c.xyz,2)} "
+    #         f"UV={np.round(c.uv,1)}"
+    #     )
 
-    print("=========================================\n")
+    # print("=========================================\n")
 
     return correspondences
 
@@ -117,10 +117,10 @@ def solve_pnp(
         [c.uv for c in correspondences],
         dtype=np.float64,
     )
-    print("\n========== PnP INPUT ==========")
-    print("Object points :", object_points.shape)
-    print("Image points  :", image_points.shape)
-    print("===============================\n")
+    # print("\n========== PnP INPUT ==========")
+    # print("Object points :", object_points.shape)
+    # print("Image points  :", image_points.shape)
+    # print("===============================\n")
 
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
             object_points,
@@ -146,19 +146,19 @@ def solve_pnp(
 
 
 
-    print("\n========== PnP POSE ==========")
+    # print("\n========== PnP POSE ==========")
 
-    print("Camera Center:")
-    print(C)
+    # print("Camera Center:")
+    # print(C)
 
-    print("\nRotation:")
-    print(Rwc)
+    # print("\nRotation:")
+    # print(Rwc)
 
-    print("==============================\n")
+    # print("==============================\n")
 
     
-    print("\n========== PnP RESULT ==========")
-    print("Success :", success)
+    # print("\n========== PnP RESULT ==========")
+    # print("Success :", success)
 
     if inliers is None:
         print("Inliers : 0")
