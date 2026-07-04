@@ -433,8 +433,8 @@ class VisualInertialOdometry():
         return R_cw, t_cw
 
     def VI_alignment(self, window_state, frameID, timestamp):
-        print("Current observations:", len(self.sw_state.all_ids[frameID]))
-        print("Landmarks:", len(self.sw_state.landmarks))
+        # print("Current observations:", len(self.sw_state.all_ids[frameID]))
+        # print("Landmarks:", len(self.sw_state.landmarks))
 
         success = self.run_pnp(frameID, timestamp)
 
