@@ -440,8 +440,8 @@ class VisualInertialOdometry():
         return R_cw, t_cw
 
     def VI_alignment(self, window_state, frameID, timestamp):
-        print("Current observations:", len(self.sw_state.all_ids[frameID]))
-        print("Landmarks:", len(self.sw_state.landmarks))
+        # print("Current observations:", len(self.sw_state.all_ids[frameID]))
+        # print("Landmarks:", len(self.sw_state.landmarks))
 
         success = self.run_pnp(frameID, timestamp)
 
@@ -450,7 +450,7 @@ class VisualInertialOdometry():
             return
 
         new_points_added = self.run_triangulation()
-        print("running triangulation")
+        # print("running triangulation")
 
         #
         # Build factor graph from current sliding window
@@ -461,7 +461,7 @@ class VisualInertialOdometry():
             K=self.K,
         )
 
-        factor_graph.print_summary()
+        # factor_graph.print_summary()
 
         self.bundle_adjustment = BundleAdjuster(
             factor_graph,
@@ -663,7 +663,7 @@ class VisualInertialOdometry():
             self.view_set,
             self.K,
         )
-        print(f"Triangulation: {num_added} new landmarks added.")
+        # print(f"Triangulation: {num_added} new landmarks added.")
 
         return num_added > 0
 
