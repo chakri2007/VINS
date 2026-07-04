@@ -454,7 +454,7 @@ class VisualInertialOdometry():
             K=self.K,
         )
 
-        factor_graph.print_summary()
+        # factor_graph.print_summary()
 
         self.bundle_adjustment = BundleAdjuster(
             factor_graph,

@@ -77,20 +77,20 @@ def validate_landmarks(
 
         all_errors.extend(errors)
 
-    print("\n========== Landmark Validation ==========")
-    print(f"Good landmarks : {good}")
-    print(f"Bad landmarks  : {bad}")
+    # print("\n========== Landmark Validation ==========")
+    # print(f"Good landmarks : {good}")
+    # print(f"Bad landmarks  : {bad}")
 
-    if len(all_errors):
+    # if len(all_errors):
 
-        print(
-            f"Mean error : {np.mean(all_errors):.3f} px"
-        )
+    #     print(
+    #         f"Mean error : {np.mean(all_errors):.3f} px"
+    #     )
 
-        print(
-            f"Median     : {np.median(all_errors):.3f} px"
-        )
+    #     print(
+    #         f"Median     : {np.median(all_errors):.3f} px"
+    #     )
 
-        print(
-            f"Maximum    : {np.max(all_errors):.3f} px"
-        )
+    #     print(
+    #         f"Maximum    : {np.max(all_errors):.3f} px"
+    #     )
