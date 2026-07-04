@@ -1,19 +1,26 @@
 from optimization.factor_graph import FactorGraph
 from optimization.camera_factor import CameraFactor
 import numpy as np
-from optimization.imu_factor import IMUFactor
-
-from imu.preintegration import IMUPreintegrator
-
-from memory_management.sliding_window import get_imu_measurements
 
 class GraphBuilder:
+    """
+    Builds the vision-only sliding-window factor graph (Phase 1/2:
+    SfM init + camera-only BA during VI alignment).
+
+    IMU factors are intentionally NOT added here. In the MATLAB
+    reference, factorIMU is only added to the graph once IMU alignment
+    has actually succeeded (isIMUAligned) — adding it earlier, against
+    a not-yet-metric, not-yet-gravity-aligned vision-only map, doesn't
+    match the reference and previously crashed here (imu_preintegrator
+    was being called as a function; IMUPreintegrator has no __call__).
+    IMU-factor wiring belongs in Phase 3, built on top of the
+    timestamp-indexed IMU buffer in memory_management.sliding_window
+    (extract_imu_between), once isVI_aligned is true.
+    """
 
     def __init__(self):
 
         self.information = np.eye(2)
-        self.imu_information = np.eye(9)
-        self.imu_preintegrator = IMUPreintegrator()
 
     def build(
         self,
@@ -22,7 +29,8 @@ class GraphBuilder:
         K,
     ):
         """
-        Build a fresh factor graph from the current sliding window.
+        Build a fresh vision-only factor graph from the current sliding
+        window (pose nodes, landmark nodes, camera factors — no IMU).
 
         Returns
         -------
@@ -89,42 +97,5 @@ class GraphBuilder:
                     )
 
                 )
-        
-        #
-        # ------------------------------------------------------------------
-        # IMU Factors
-        # ------------------------------------------------------------------
-        #
-
-        window_ids = sw_state.sliding_window_view_ids
-
-        for from_view, to_view in zip(window_ids[:-1], window_ids[1:]):
-
-            measurements = get_imu_measurements(
-                sw_state,
-                from_view,
-                to_view,
-            )
-
-            #
-            # No IMU data available
-            #
-            if len(measurements) == 0:
-                continue
-
-            preintegration = self.imu_preintegrator(
-                measurements,
-            )
-
-            graph.add_imu_factor(
-
-                IMUFactor(
-                    from_view=from_view,
-                    to_view=to_view,
-                    preintegration=preintegration,
-                    information=self.imu_information,
-                )
-
-            )
 
         return graph

@@ -83,6 +83,21 @@ class ViewSet:
 
         self._view_ids.append(view_id)
 
+    def get_view(
+        self,
+        view_id: int,
+    ) -> View:
+        """
+        Return the complete View object.
+        """
+
+        if view_id not in self._views:
+            raise KeyError(
+                f"View {view_id} not found."
+            )
+
+        return self._views[view_id]
+
     def update_pose(
         self,
         view_id: int,

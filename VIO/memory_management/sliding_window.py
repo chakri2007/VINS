@@ -14,8 +14,10 @@ takes its slot — but the new frame's data is being written right now, so
 at all times.  Both are updated together.
 """
 
+import bisect
+
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -64,14 +66,40 @@ class SlidingWindowState:
     # ------------------------------------------------------------------
     # IMU measurements
     #
-    # key:
-    #     (from_view, to_view)
+    # A single continuous, timestamp-ordered buffer of every IMU sample
+    # received so far (that hasn't been pruned yet). This mirrors the
+    # MATLAB reference, which never chunks IMU data by frame-to-frame
+    # pairs — it always re-slices the full gyroReadings/accelReadings
+    # arrays by timestamp (helperExtractIMUDataBetweenViews). Slicing
+    # this buffer by the timestamps of two arbitrary keyframes (see
+    # extract_imu_between) works correctly regardless of how many
+    # non-keyframes were dropped in between them, which per-pair
+    # dict storage kept keyed by raw consecutive frame ids did not.
     #
-    # value:
-    #     list[IMUMeasurement]
+    # Samples are pruned from the front once the sliding window's
+    # oldest keyframe advances past them (see prune_imu_before) —
+    # not when individual raw frames are dropped as non-keyframes,
+    # since their IMU interval may still be needed to bridge two
+    # surviving keyframes.
     # ------------------------------------------------------------------
 
-    imu_measurements: Dict[tuple[int, int], list[IMUMeasurement]] = field(
+    imu_buffer: List[IMUMeasurement] = field(default_factory=list)
+
+    metric_scale: float = 1.0
+
+    gravity: np.ndarray = field(
+        default_factory=lambda: np.array([0.0, 0.0, -9.81])
+    )
+
+    accelerometer_bias: np.ndarray = field(
+        default_factory=lambda: np.zeros(3)
+    )
+
+    gyroscope_bias: np.ndarray = field(
+        default_factory=lambda: np.zeros(3)
+    )
+
+    velocities: Dict[int, np.ndarray] = field(
         default_factory=dict
     )
 
@@ -273,45 +301,115 @@ def update_sliding_window(
             # current_sliding_window_index unchanged — still window_size
             window_state["isEnoughParallax"] = True
 
-    #
-    # Remove IMU data associated with frames that left the window
-    #
-    if removed_frame_id >= 0:
-
-        keys_to_remove = []
-
-        for key in list(state.imu_measurements):
-
-            if removed_frame_id in key:
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del state.imu_measurements[key]
+    # Note: IMU data is no longer evicted here based on which raw frame
+    # got dropped. The IMU buffer is timestamp-indexed (see imu_buffer
+    # above) and pruned separately, by timestamp, once the sliding
+    # window's oldest surviving keyframe actually advances — see
+    # prune_imu_before. A dropped non-keyframe's IMU interval must stay
+    # in the buffer, since it may still be needed to bridge the gap
+    # between two keyframes that end up on either side of it.
 
     return removed_frame_id, window_state
 
-def add_imu_measurements(
+
+# ============================================================
+# IMU buffer — continuous, timestamp-ordered storage
+# ============================================================
+
+def append_imu_measurement(
     state: SlidingWindowState,
-    from_view: int,
-    to_view: int,
-    measurements,
+    measurement: IMUMeasurement,
 ):
     """
-    Store all IMU samples between two consecutive views.
+    Append one IMU sample to the continuous buffer.
+
+    Assumes measurements arrive in non-decreasing timestamp order
+    (true for a live sensor stream); extract_imu_between/
+    prune_imu_before rely on the buffer being sorted by timestamp.
     """
 
-    state.imu_measurements[(from_view, to_view)] = list(measurements)
+    state.imu_buffer.append(measurement)
 
-def get_imu_measurements(
+
+def _nearest_index(timestamps: List[float], t: float) -> int:
+    """
+    Index of the buffer sample whose timestamp is closest to `t`.
+
+    Mirrors MATLAB's
+        [~,ind] = min(abs(timeStamps.imuTimeStamps - t))
+    but exploits the fact that `timestamps` is sorted, via bisect,
+    instead of scanning the whole array.
+    """
+
+    i = bisect.bisect_left(timestamps, t)
+
+    if i <= 0:
+        return 0
+    if i >= len(timestamps):
+        return len(timestamps) - 1
+
+    before = timestamps[i - 1]
+    after = timestamps[i]
+
+    return (i - 1) if (t - before) <= (after - t) else i
+
+
+def extract_imu_between(
     state: SlidingWindowState,
-    from_view: int,
-    to_view: int,
+    t0: float,
+    t1: float,
+) -> List[IMUMeasurement]:
+    """
+    Return all IMU samples between two timestamps.
+
+    Direct Python equivalent of
+    helperExtractIMUDataBetweenViews for a single (i,j) pair: finds
+    the buffer index nearest each endpoint timestamp and returns the
+    half-open slice [ind1:ind2), matching MATLAB's ind1:(ind2-1) in
+    1-based inclusive indexing.
+
+    Parameters
+    ----------
+    t0, t1 : float
+        Timestamps of the two views bounding the interval (t0 < t1).
+
+    Returns
+    -------
+    list[IMUMeasurement]
+    """
+
+    if len(state.imu_buffer) < 2:
+        return []
+
+    timestamps = [m.timestamp for m in state.imu_buffer]
+
+    ind1 = _nearest_index(timestamps, t0)
+    ind2 = _nearest_index(timestamps, t1)
+
+    if ind2 <= ind1:
+        return []
+
+    return state.imu_buffer[ind1:ind2]
+
+
+def prune_imu_before(
+    state: SlidingWindowState,
+    keep_from_timestamp: float,
 ):
     """
-    Return IMU samples between two views.
+    Drop buffer samples that can no longer be needed.
+
+    Call this once the sliding window's oldest surviving keyframe
+    advances (i.e. a keyframe permanently leaves the window), passing
+    that new oldest keyframe's timestamp. Keeps one extra sample
+    before the cutoff as a boundary margin for `extract_imu_between`.
     """
 
-    return state.imu_measurements.get(
-        (from_view, to_view),
-        [],
-    )
+    if not state.imu_buffer:
+        return
+
+    timestamps = [m.timestamp for m in state.imu_buffer]
+
+    idx = bisect.bisect_left(timestamps, keep_from_timestamp)
+
+    state.imu_buffer = state.imu_buffer[max(0, idx - 1):]

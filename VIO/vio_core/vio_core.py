@@ -9,7 +9,9 @@ from memory_management.view_set import ViewSet
 from memory_management.sliding_window import (
     SlidingWindowState,
     update_sliding_window,
-    add_imu_measurements,
+    append_imu_measurement,
+    extract_imu_between,
+    prune_imu_before,
 )
 from imu.imu_measurement import IMUMeasurement
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
@@ -21,6 +23,10 @@ from optimization.graph_builder import GraphBuilder
 from optimization.ceres_bundle_adjustment import CeresBundleAdjuster as BundleAdjuster
 from optimization.state_update import update_state_from_graph
 from optimization.median_depth import normalize_map
+from imu.vi_alignment import (
+    initialize_visual_inertial_state,
+)
+from imu.preintegration import IMUPreintegrator
 
 
 class VisualInertialOdometry():
@@ -34,6 +40,16 @@ class VisualInertialOdometry():
         self.T_BS = np.array(
             self.left_calib['T_BS']['data']
         ).reshape(4, 4)
+
+        #
+        # IMU noise/extrinsic calibration. self.T_BS above (from the
+        # camera yaml) is the camera->body extrinsic used to fold poses
+        # into the body frame before VI alignment (see VI_alignment()).
+        # imu_calib carries the noise densities used to construct the
+        # IMUPreintegrator; falls back to IMUPreintegrator's own
+        # defaults if imu.yaml wasn't supplied by the caller.
+        #
+        self.imu_calib = calib_data.get('imu', {})
 
         self.K_raw = np.array([
             [self.intrinsics[0], 0,                  self.intrinsics[2]],
@@ -68,11 +84,6 @@ class VisualInertialOdometry():
         self.view_set          = ViewSet()
         self.sw_state          = SlidingWindowState(window_size=21)
         self.prev_img_frame    = None
-        #
-        # IMU buffer between consecutive images
-        #
-        self.imu_buffer = []
-        self.previous_image_view_id = None
 
         self.removed_frame_ids: list = []
 
@@ -91,25 +102,6 @@ class VisualInertialOdometry():
     def vio_loop(self, raw_img_frame, timestamp):
 
         self.frameID += 1
-
-        #
-        # Store IMU measurements between consecutive images
-        #
-        if self.previous_image_view_id is not None:
-
-            add_imu_measurements(
-                self.sw_state,
-                self.previous_image_view_id,
-                self.frameID,
-                self.imu_buffer,
-            )
-
-        #
-        # Clear IMU buffer for next image interval
-        #
-        self.imu_buffer.clear()
-
-        self.previous_image_view_id = self.frameID
 
         # self.img_frame, self.K = preprocess_image(
         #     raw_img_frame,
@@ -207,6 +199,8 @@ class VisualInertialOdometry():
         self.view_set.add_view(view_id=frameID, R=np.eye(3), t=np.zeros(3), timestamp=timestamp)
         self.isFirstFrame = False
 
+        self._prune_imu_buffer()
+
     def process_frontend(self, img_frame, frameID):
         prev_stored_id = self.sw_state.current_view_id
         prev_points    = self.sw_state.all_observations[prev_stored_id]
@@ -297,7 +291,25 @@ class VisualInertialOdometry():
 
         self.prev_img_frame = img_frame
 
+        self._prune_imu_buffer()
+
         return window_state
+
+    def _prune_imu_buffer(self):
+        """
+        Drop IMU samples older than the sliding window's oldest
+        surviving keyframe. Safe to call after every window update:
+        does nothing if the window is empty, and extract_imu_between
+        only ever needs data from the oldest kept keyframe onward.
+        """
+
+        sw_ids = self.sw_state.sliding_window_view_ids
+
+        if len(sw_ids) == 0:
+            return
+
+        oldest_timestamp = self.view_set.get_timestamp(sw_ids[0])
+        prune_imu_before(self.sw_state, oldest_timestamp)
     
     def get_active_tracks(self, max_history_length: int = 10) -> dict:
         """Build track history for every point still alive in the current frame,
@@ -465,11 +477,112 @@ class VisualInertialOdometry():
                             self.view_set,
                             self.sw_state,
                         )
+                if not self.isVIO_initialized:
+
+                    self.try_vi_alignment()
 
             self.bundle_adjustment.clear_fixed_poses()
 
+    def try_vi_alignment(self):
+        """
+        Attempt linear visual-inertial alignment (metric scale, gravity
+        direction, per-keyframe velocities, accelerometer bias) over
+        the current sliding window.
 
-        # IMU alignment
+        Mirrors the MATLAB reference's use of
+        swIDs = getSlidingWindowIDs(fpManager); swIDs = swIDs(1:end-1);
+        i.e. every *closed* keyframe interval in the window except the
+        newest, still-open one — each interval needs a completed IMU
+        preintegration between two confirmed keyframe timestamps.
+        """
+
+        sw_ids = list(self.sw_state.sliding_window_view_ids)
+
+        # Need at least two closed intervals (3 keyframes) for the
+        # alignment system in vi_alignment.py to be solvable at all
+        # (3*N+7 unknowns from N keyframes; each pair contributes 6
+        # equations).
+        align_view_ids = sw_ids[:-1]
+
+        if len(align_view_ids) < 3:
+            return
+
+        imu_preintegrations = self._build_imu_preintegrations(align_view_ids)
+
+        if imu_preintegrations is None:
+            # Missing IMU coverage for at least one interval -- can't
+            # run alignment yet.
+            return
+
+        result = initialize_visual_inertial_state(
+            view_set=self.view_set,
+            sliding_window=self.sw_state,
+            imu_preintegrations=imu_preintegrations,
+            view_ids=align_view_ids,
+            sensor_transform=self.T_BS,
+            apply_scale_to_map=False,
+        )
+
+        if result.success:
+
+            print("\n========== VI Alignment ==========")
+            print("Scale:", result.scale)
+            print("Gravity:", result.gravity)
+            print("Accel Bias:", result.accel_bias)
+
+            self.isVIO_initialized = True
+
+    def _build_imu_preintegrations(self, view_ids):
+        """
+        Preintegrate IMU data between every consecutive pair of
+        `view_ids`, sourced from the continuous timestamp-ordered
+        sw_state.imu_buffer (see extract_imu_between).
+
+        Uses the sliding window's current bias estimates as the
+        preintegrator's linearization point -- zero before alignment
+        has ever succeeded, matching MATLAB (no bias correction is
+        available yet at this stage either).
+
+        Returns
+        -------
+        dict[(int,int), PreintegratedIMU], or None if any interval is
+        missing IMU coverage (e.g. IMU stream hasn't caught up yet).
+        """
+
+        preintegrations = {}
+
+        for i, j in zip(view_ids[:-1], view_ids[1:]):
+
+            t_i = self.view_set.get_timestamp(i)
+            t_j = self.view_set.get_timestamp(j)
+
+            samples = extract_imu_between(self.sw_state, t_i, t_j)
+
+            if len(samples) < 2:
+                return None
+
+            preintegrator = IMUPreintegrator(
+                gyro_noise=self.imu_calib.get(
+                    'gyroscope_noise_density', 1.0e-3
+                ),
+                accel_noise=self.imu_calib.get(
+                    'accelerometer_noise_density', 1.0e-2
+                ),
+                gyro_random_walk=self.imu_calib.get(
+                    'gyroscope_random_walk', 1.0e-5
+                ),
+                accel_random_walk=self.imu_calib.get(
+                    'accelerometer_random_walk', 1.0e-4
+                ),
+                bias_g=self.sw_state.gyroscope_bias,
+                bias_a=self.sw_state.accelerometer_bias,
+            )
+
+            preintegrations[(i, j)] = preintegrator.integrate_measurements(
+                samples
+            )
+
+        return preintegrations
 
     def run_pnp(self, frameID, timestamp):
 
@@ -587,17 +700,22 @@ class VisualInertialOdometry():
         timestamp,
     ):
         """
-        Store incoming IMU measurements until the next image arrives.
+        Append an incoming IMU sample to the continuous, timestamp-
+        ordered buffer (sw_state.imu_buffer). Preintegration between
+        any two keyframes is computed on demand from this buffer (see
+        _build_imu_preintegrations), by slicing on timestamp rather
+        than tracking per-frame-interval chunks — this works correctly
+        regardless of which raw frames end up as non-keyframes and get
+        dropped from the sliding window.
         """
 
-        self.imu_buffer.append(
-
+        append_imu_measurement(
+            self.sw_state,
             IMUMeasurement(
                 timestamp=timestamp,
                 accel=np.asarray(accel, dtype=np.float64),
                 gyro=np.asarray(gyro, dtype=np.float64),
-            )
-
+            ),
         )
     def visual_inertial_optimization(self, window_state, frameID):
         pass

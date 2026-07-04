@@ -95,8 +95,22 @@ class VisualOdometryNode(Node):
             )
 
     def _imu_callback(self, msg: Imu):
-        # Stored for Phase 2 VI alignment — no-op for now.
-        pass
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+        accel = np.array([
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z,
+        ])
+        gyro = np.array([
+            msg.angular_velocity.x,
+            msg.angular_velocity.y,
+            msg.angular_velocity.z,
+        ])
+
+        # Appends to sw_state.imu_buffer (timestamp-ordered); consumed on
+        # demand by _build_imu_preintegrations via extract_imu_between.
+        self.vio.process_imu(accel, gyro, timestamp)
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -107,6 +121,20 @@ class VisualOdometryNode(Node):
         if self.mode == 'stereo':
             with open(self.ros_config['right_camera_config_path'], 'r') as f:
                 calib['right'] = yaml.safe_load(f)
+
+        # IMU noise densities + T_BS (imu.yaml), consumed by
+        # VisualInertialOdometry.__init__ as calib_data['imu'] and passed
+        # through to IMUPreintegrator in _build_imu_preintegrations.
+        imu_config_path = self.ros_config.get('imu_config_path')
+        if imu_config_path:
+            with open(imu_config_path, 'r') as f:
+                calib['imu'] = yaml.safe_load(f)
+        else:
+            self.get_logger().warn(
+                "No 'imu_config_path' in ros_config.yaml — "
+                "IMUPreintegrator will fall back to its default noise params."
+            )
+
         return calib
 
     def destroy_node(self):
