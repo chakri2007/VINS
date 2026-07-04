@@ -383,9 +383,9 @@ def add_landmarks(
 
         added += 1
 
-    print(
-        f"[Landmarks] Added {added} landmarks."
-    )
+    # print(
+    #     f"[Landmarks] Added {added} landmarks."
+    # )
 
     return added
 
