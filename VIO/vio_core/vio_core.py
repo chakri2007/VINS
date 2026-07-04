@@ -92,6 +92,13 @@ class VisualInertialOdometry():
         self.isVIO_initialized = False
         self.isVI_aligned      = False
 
+        # Latched once True — mirrors MATLAB's `readyToAlignCameraAndIMU`.
+        # Set the first time window_state["isWindowFull"] is seen (i.e.
+        # the sliding window has reached full size at least once), and
+        # never reset afterward. Alignment attempts are gated on this
+        # instead of the old bare `len(align_view_ids) >= 3` floor.
+        self.readyToAlignCameraAndIMU = False
+
         self.frameID = 0
 
         self.graph_builder = GraphBuilder()
@@ -433,8 +440,8 @@ class VisualInertialOdometry():
         return R_cw, t_cw
 
     def VI_alignment(self, window_state, frameID, timestamp):
-        # print("Current observations:", len(self.sw_state.all_ids[frameID]))
-        # print("Landmarks:", len(self.sw_state.landmarks))
+        print("Current observations:", len(self.sw_state.all_ids[frameID]))
+        print("Landmarks:", len(self.sw_state.landmarks))
 
         success = self.run_pnp(frameID, timestamp)
 
@@ -454,7 +461,7 @@ class VisualInertialOdometry():
             K=self.K,
         )
 
-        # factor_graph.print_summary()
+        factor_graph.print_summary()
 
         self.bundle_adjustment = BundleAdjuster(
             factor_graph,
@@ -477,7 +484,16 @@ class VisualInertialOdometry():
                             self.view_set,
                             self.sw_state,
                         )
-                if not self.isVIO_initialized:
+
+                # Latch once the window has been full at least once —
+                # mirrors MATLAB's
+                #   if windowState.isWindowFull && ~readyToAlignCameraAndIMU
+                #       readyToAlignCameraAndIMU = true;
+                # Never reset back to False afterward.
+                if window_state.get("isWindowFull") and not self.readyToAlignCameraAndIMU:
+                    self.readyToAlignCameraAndIMU = True
+
+                if not self.isVIO_initialized and self.readyToAlignCameraAndIMU:
 
                     self.try_vi_alignment()
 
@@ -489,7 +505,9 @@ class VisualInertialOdometry():
         direction, per-keyframe velocities, accelerometer bias) over
         the current sliding window.
 
-        Mirrors the MATLAB reference's use of
+        Only called once `self.readyToAlignCameraAndIMU` has latched
+        True (window has been full at least once) — see VI_alignment().
+        This mirrors the MATLAB reference's use of
         swIDs = getSlidingWindowIDs(fpManager); swIDs = swIDs(1:end-1);
         i.e. every *closed* keyframe interval in the window except the
         newest, still-open one — each interval needs a completed IMU
@@ -498,12 +516,10 @@ class VisualInertialOdometry():
 
         sw_ids = list(self.sw_state.sliding_window_view_ids)
 
-        # Need at least two closed intervals (3 keyframes) for the
-        # alignment system in vi_alignment.py to be solvable at all
-        # (3*N+7 unknowns from N keyframes; each pair contributes 6
-        # equations).
         align_view_ids = sw_ids[:-1]
 
+        # Should always hold once the window has been full at least
+        # once, but keep as a defensive floor for solvability.
         if len(align_view_ids) < 3:
             return
 
