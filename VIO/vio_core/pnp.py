@@ -160,12 +160,12 @@ def solve_pnp(
     # print("\n========== PnP RESULT ==========")
     # print("Success :", success)
 
-    if inliers is None:
-        print("Inliers : 0")
-    else:
-        print("Inliers :", len(inliers))
+    # if inliers is None:
+    #     print("Inliers : 0")
+    # else:
+    #     print("Inliers :", len(inliers))
 
-    print("================================\n")
+    # print("================================\n")
 
     return Rwc, C, inliers
 
