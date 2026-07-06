@@ -202,7 +202,7 @@ while ~status.isIMUAligned
             [gRot,scale,info] = ...
 
                 estimateGravityRotationAndPoseScale(camPoses,gyro,accel, ...
-                
+
                 SensorTransform=data.camToIMUTransform,IMUParameters=imuParams);
             disp("Estimated scale: " + scale);
 
@@ -380,6 +380,19 @@ while currFrameIdx < endFrameIdx + 1
     end
     swIDs = getSlidingWindowIDs(fpManager);
 end
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 %% Results
 axf = axes(figure);

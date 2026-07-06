@@ -13,9 +13,3 @@ find_package(pybind11 REQUIRED)
 
 pybind11_add_module(ceres_ba ceres_ba.cpp)
 target_link_libraries(ceres_ba PRIVATE Ceres::ceres Eigen3::Eigen)
-
-# Motion-only (single-frame) bundle adjustment -- BA_motion, the Ceres
-# port of helperBundleAdjustmentMotion.m. Separate extension module so
-# the existing vision-only ceres_ba target/build is untouched.
-pybind11_add_module(ceres_ba_motion ceres_ba_motion.cpp)
-target_link_libraries(ceres_ba_motion PRIVATE Ceres::ceres Eigen3::Eigen)

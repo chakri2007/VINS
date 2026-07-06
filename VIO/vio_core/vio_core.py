@@ -21,6 +21,7 @@ from vio_core.reprojection import validate_landmarks
 from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence, solve_pnp
 from optimization.graph_builder import GraphBuilder
 from optimization.ceres_bundle_adjustment import CeresBundleAdjuster as BundleAdjuster
+from optimization.ceres_bundle_adjustment_motion import bundle_adjustment_motion
 from optimization.state_update import update_state_from_graph
 from optimization.median_depth import normalize_map
 from imu.vi_alignment import (
@@ -161,6 +162,7 @@ class VisualInertialOdometry():
             self.visual_inertial_optimization(
                 window_state,
                 self.frameID,
+                timestamp,
             )
 
     def process_frame_mono(self, raw_img_frame, img_frame_timestamp):
@@ -733,5 +735,149 @@ class VisualInertialOdometry():
                 gyro=np.asarray(gyro, dtype=np.float64),
             ),
         )
-    def visual_inertial_optimization(self, window_state, frameID):
-        pass
+    def _build_single_imu_preintegration(self, from_view_id, to_view_id, to_timestamp):
+        """
+        Preintegrate IMU samples between an existing view (from_view_id,
+        already in view_set) and a not-yet-added frame (to_view_id, whose
+        timestamp is supplied directly since it hasn't been added yet).
+
+        Uses the sliding window's current bias estimates as the
+        linearization point, same convention as
+        _build_imu_preintegrations. Returns None if IMU coverage is
+        insufficient (mirrors that function's behaviour for a single pair).
+        """
+
+        t_from = self.view_set.get_timestamp(from_view_id)
+
+        samples = extract_imu_between(self.sw_state, t_from, to_timestamp)
+
+        if len(samples) < 2:
+            return None
+
+        preintegrator = IMUPreintegrator(
+            gyro_noise=self.imu_calib.get(
+                'gyroscope_noise_density', 1.0e-3
+            ),
+            accel_noise=self.imu_calib.get(
+                'accelerometer_noise_density', 1.0e-2
+            ),
+            gyro_random_walk=self.imu_calib.get(
+                'gyroscope_random_walk', 1.0e-5
+            ),
+            accel_random_walk=self.imu_calib.get(
+                'accelerometer_random_walk', 1.0e-4
+            ),
+            bias_g=self.sw_state.gyroscope_bias,
+            bias_a=self.sw_state.accelerometer_bias,
+        )
+
+        return preintegrator.integrate_measurements(samples)
+
+    def visual_inertial_optimization(self, window_state, frameID, timestamp):
+        """
+        Phase 3 (post VI-alignment) per-frame step, up through
+        helperBundleAdjustmentMotion.m ("BA_motion"):
+
+            1. PnP pose guess for the new frame (helperEstimateCameraPose)
+            2. IMU preintegration between the previous view and this frame
+               (helperExtractIMUDataBetweenViews)
+            3. Motion-only Ceres BA refining this frame's
+               [pose, velocity, bias] against the fixed previous state
+               (helperBundleAdjustmentMotion)
+            4. Write the refined pose/velocity/bias back and register
+               valid landmark observations on this view.
+
+        The sliding-window FactorGraph / optimize(fg, ...) full-window
+        smoothing step is intentionally NOT invoked here yet -- that is
+        the next phase, built on top of this one.
+        """
+
+        if self.view_set.num_views == 0:
+            return
+
+        # Previous view already committed to the view set/graph.
+        prev_view_id = self.view_set.view_ids[-1]
+
+        prev_velocity = self.sw_state.velocities.get(prev_view_id)
+        if prev_velocity is None:
+            # No velocity estimate yet for the previous view -- can't
+            # form the IMU factor's previous-state anchor.
+            print("[VIO] No velocity estimate for previous view; skipping BA_motion.")
+            return
+
+        # ---- 1. PnP pose guess for the new frame ------------------------
+        correspondences = find_pnp_correspondences(self.sw_state, frameID)
+
+        if len(correspondences) < 6:
+            print("[VIO] Not enough PnP correspondences; skipping BA_motion.")
+            return
+
+        pnp_result = solve_pnp(correspondences, self.K)
+
+        if pnp_result is None:
+            print("[VIO] PnP failed; skipping BA_motion.")
+            return
+
+        R_guess, C_guess, inliers = pnp_result
+
+        if inliers is None or len(inliers) == 0:
+            print("[VIO] PnP found no inliers; skipping BA_motion.")
+            return
+
+        inlier_idx = inliers.flatten()
+        xyz_pts = np.array([correspondences[i].xyz for i in inlier_idx])
+        uv_pts = np.array([correspondences[i].uv for i in inlier_idx])
+        point_ids = [correspondences[i].point_id for i in inlier_idx]
+
+        # ---- 2. IMU preintegration between previous view and this frame --
+        preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
+
+        if preint is None:
+            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
+            return
+
+        prev_pose = self.view_set.get_pose(prev_view_id)
+        prev_bias = (self.sw_state.gyroscope_bias, self.sw_state.accelerometer_bias)
+
+        # Constant-velocity model for the initial guess -- BA_motion
+        # refines it using the IMU factor + reprojection factors.
+        velocity_guess = prev_velocity.copy()
+
+        # ---- 3. Motion-only Ceres BA --------------------------------------
+        result = bundle_adjustment_motion(
+            xyz_tracked_in_current_view=xyz_pts,
+            current_view_correspondences=uv_pts,
+            intrinsics_K=self.K,
+            image_size=self.img_frame.shape,
+            current_view_pose_guess=(R_guess, C_guess),
+            current_view_velocity_guess=velocity_guess,
+            previous_view_pose=prev_pose,
+            previous_view_velocity=prev_velocity,
+            previous_view_bias=prev_bias,
+            preintegrated_imu=preint,
+            R_bs=self.T_BS[:3, :3],
+            t_bs=self.T_BS[:3, 3],
+        )
+
+        refined_pose, vel_refined, bias_refined, valid = result
+
+        if refined_pose is None:
+            print("[VIO] BA_motion did not converge; skipping state update.")
+            return
+
+        R_refined, C_refined = refined_pose
+
+        # ---- 4. Write refined state back ------------------------------------
+        self.view_set.add_view(frameID, R_refined, C_refined, timestamp)
+        self.sw_state.velocities[frameID] = vel_refined
+        self.sw_state.gyroscope_bias = bias_refined[0]
+        self.sw_state.accelerometer_bias = bias_refined[1]
+
+        for k, is_valid in enumerate(valid):
+            if is_valid:
+                landmark = self.sw_state.landmarks[point_ids[k]]
+                landmark.add_observation(frameID, uv_pts[k])
+
+        # NOTE: sliding-window FactorGraph build + optimize(fg, ...)
+        # (full window smoothing over multiple keyframes/IMU factors)
+        # intentionally stops here for now -- next phase.
