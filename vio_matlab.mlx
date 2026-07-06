@@ -200,7 +200,9 @@ while ~status.isIMUAligned
             [xyz] = getXYZPoints(fpManager,xyzIds);
             camPoses = poses(viewSet,swIDs);
             [gRot,scale,info] = ...
+
                 estimateGravityRotationAndPoseScale(camPoses,gyro,accel, ...
+                
                 SensorTransform=data.camToIMUTransform,IMUParameters=imuParams);
             disp("Estimated scale: " + scale);
 

@@ -8,18 +8,31 @@ This module estimates the initial
     - metric scale
     - gravity
     - camera velocities
-    - accelerometer bias
 
 from
 
     - visual poses (ViewSet)
     - IMU preintegration
 
+Accelerometer bias is intentionally NOT solved for in this linear
+system. Following Qin et al. (VINS-Mono): accel bias is strongly
+coupled with gravity direction (both look like a near-constant offset
+vector when the trajectory segment doesn't rotate much), and this
+short initialization window doesn't carry enough independent rotation
+to separate them reliably. Solving for both jointly lets the solver
+silently trade error between them, which is exactly the instability
+(sign-flipped/drifting scale) observed empirically. So accel bias is
+fixed at zero here (matching sliding_window's zero default prior to
+alignment) and left for the nonlinear Phase 3 optimizer to estimate
+properly, once there's enough diverse motion for it to be observable.
+
 The implementation follows the initialization procedure used in
 
     Qin et al. (VINS-Mono)
     Forster et al.
-    MATLAB Navigation Toolbox VIO
+    MATLAB Navigation Toolbox VIO   (differs here: MATLAB's
+        estimateGravityRotationAndPoseScale does solve accel bias
+        jointly; this module follows VINS-Mono's choice instead)
 
 Author:
     VIO Project
@@ -317,9 +330,14 @@ def collect_alignment_pairs(
 # Helpers - unknown vector layout
 # ============================================================
 #
-# x = [ v_0 ... v_{N-1} | gravity(3) | scale(1) | accel_bias(3) ]
+# x = [ v_0 ... v_{N-1} | gravity(3) | scale(1) ]
 #
-# Total size = 3N + 7
+# Total size = 3N + 4
+#
+# NOTE: accel_bias is intentionally NOT part of the unknown vector
+# (see module docstring) — it is fixed at zero, matching VINS-Mono's
+# initialization choice, rather than solved for jointly with
+# scale/gravity as MATLAB's reference does.
 #
 
 def number_of_unknowns(
@@ -327,10 +345,11 @@ def number_of_unknowns(
 ):
     """
     Unknown vector size: 3N (velocities) + 3 (gravity) + 1 (scale)
-    + 3 (accel bias) = 3N + 7.
+    = 3N + 4. Accel bias is fixed at zero, not part of the unknowns
+    (see module docstring).
     """
 
-    return 3 * num_views + 7
+    return 3 * num_views + 4
 
 
 def velocity_column(
@@ -364,16 +383,6 @@ def scale_column(
     return 3 * num_views + 3
 
 
-def accel_bias_column(
-    num_views: int,
-):
-    """
-    Starting column of accelerometer bias.
-    """
-
-    return 3 * num_views + 4
-
-
 # ============================================================
 # Per-pair linear equation
 # ============================================================
@@ -381,8 +390,13 @@ def accel_bias_column(
 # Preintegrated IMU measurement model (body/camera frame == IMU frame
 # assumed here; if R_bc != I it must be folded into R_i/R_j upstream):
 #
-#   delta_p_ij = R_i^T ( s*p_j - s*p_i - v_i*dt - 0.5*g*dt^2 ) + J_p_ba*ba
-#   delta_v_ij = R_i^T ( v_j - v_i - g*dt )                    + J_v_ba*ba
+#   delta_p_ij = R_i^T ( s*p_j - s*p_i - v_i*dt - 0.5*g*dt^2 )
+#   delta_v_ij = R_i^T ( v_j - v_i - g*dt )
+#
+# Accel bias is fixed at zero (see module docstring) so the J_p_ba /
+# J_v_ba Jacobian terms are dropped entirely rather than contributing
+# an unknown column — delta_p/delta_v are already the preintegrated
+# values computed with zero bias upstream in preintegration.py.
 #
 # p_i, p_j are the *unscaled* visual translations, and s is the metric
 # scale factor such that p_metric = s * p_visual. Rearranged into
@@ -390,11 +404,11 @@ def accel_bias_column(
 #
 #   position rows:
 #       -R_i^T*dt * v_i + 0*v_j - 0.5*R_i^T*dt^2 * g
-#           + R_i^T*(p_j - p_i) * s - J_p_ba * ba = delta_p
+#           + R_i^T*(p_j - p_i) * s = delta_p
 #
 #   velocity rows:
 #       -R_i^T * v_i + R_i^T * v_j - R_i^T*dt * g
-#           + 0 * s + J_v_ba * ba = delta_v
+#           + 0 * s = delta_v
 #
 
 def build_pair_equation(
@@ -403,7 +417,7 @@ def build_pair_equation(
     num_views: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build the (6, 3N+7) block and (6,) right-hand side for a single
+    Build the (6, 3N+4) block and (6,) right-hand side for a single
     consecutive keyframe pair.
 
     Parameters
@@ -419,7 +433,7 @@ def build_pair_equation(
 
     Returns
     -------
-    A_pair : ndarray, shape (6, 3N+7)
+    A_pair : ndarray, shape (6, 3N+4)
     b_pair : ndarray, shape (6,)
     """
 
@@ -437,14 +451,12 @@ def build_pair_equation(
     vj_col = velocity_column(index_i + 1)
     g_col = gravity_column(num_views)
     s_col = scale_column(num_views)
-    ba_col = accel_bias_column(num_views)
 
     # ---- position rows (0:3) ----
 
     A_pair[0:3, vi_col:vi_col + 3] = -Ri_T * dt
     A_pair[0:3, g_col:g_col + 3] = -0.5 * Ri_T * dt2
     A_pair[0:3, s_col] = Ri_T @ (pair.p_j - pair.p_i)
-    A_pair[0:3, ba_col:ba_col + 3] = -pair.J_p_ba
 
     b_pair[0:3] = pair.delta_p
 
@@ -453,7 +465,6 @@ def build_pair_equation(
     A_pair[3:6, vi_col:vi_col + 3] = -Ri_T
     A_pair[3:6, vj_col:vj_col + 3] = Ri_T
     A_pair[3:6, g_col:g_col + 3] = -Ri_T * dt
-    A_pair[3:6, ba_col:ba_col + 3] = pair.J_v_ba
 
     b_pair[3:6] = pair.delta_v
 
@@ -582,10 +593,11 @@ def solve_alignment(
         ]
     )
 
-    accel_bias = x[
-        accel_bias_column(num_views):
-        accel_bias_column(num_views) + 3
-    ].copy()
+    # Accel bias is fixed at zero, not part of the solved unknown
+    # vector (see module docstring). Kept as a field on the result
+    # for downstream compatibility with apply_alignment_result() /
+    # sliding_window.accelerometer_bias, which still expect it.
+    accel_bias = np.zeros(3)
 
     return VIAlignmentResult(
         success=True,
