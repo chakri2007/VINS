@@ -549,6 +549,12 @@ class VisualInertialOdometry():
             print("Accel Bias:", result.accel_bias)
 
             self.isVIO_initialized = True
+            self.isVI_aligned = True
+
+            newest_id = sw_ids[-1]
+            prev_id = align_view_ids[-1]
+            if prev_id in self.sw_state.velocities:
+                self.sw_state.velocities[newest_id] = self.sw_state.velocities[prev_id].copy()
 
     def _build_imu_preintegrations(self, view_ids):
         """
