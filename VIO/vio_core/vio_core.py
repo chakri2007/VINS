@@ -545,6 +545,64 @@ class VisualInertialOdometry():
             # run alignment yet.
             return
 
+        # --- Debug dump for MATLAB comparison (first attempt only) ---
+        if not hasattr(self, "_saved_alignment_debug_data"):
+            self._saved_alignment_debug_data = True
+
+            import scipy.io
+            from memory_management.sliding_window import extract_imu_between
+
+            N = len(align_view_ids)
+
+            # Camera poses (camera-to-world, same convention MATLAB uses)
+            campose_R = np.zeros((3, 3, N))
+            campose_t = np.zeros((N, 3))
+            for k, vid in enumerate(align_view_ids):
+                R, t = self.view_set.get_pose(vid)
+                campose_R[:, :, k] = R
+                campose_t[k, :] = t
+
+            # Raw IMU between each consecutive pair (NOT preintegrated --
+            # MATLAB's estimateGravityRotationAndPoseScale wants raw samples)
+            gyroData = np.empty((1, N - 1), dtype=object)
+            accelData = np.empty((1, N - 1), dtype=object)
+            for k, (i, j) in enumerate(zip(align_view_ids[:-1], align_view_ids[1:])):
+                t_i = self.view_set.get_timestamp(i)
+                t_j = self.view_set.get_timestamp(j)
+                samples = extract_imu_between(self.sw_state, t_i, t_j)
+                gyroData[0, k] = np.vstack([m.gyro for m in samples])
+                accelData[0, k] = np.vstack([m.accel for m in samples])
+
+            # Camera->IMU extrinsic (T_BS)
+            T_BS_R = self.T_BS[:3, :3]
+            T_BS_t = self.T_BS[:3, 3]
+
+            # IMU noise params, for parity with estimateGravityRotationAndPoseScale's IMUParameters
+            imuSampleRate     = self.imu_calib.get('rate_hz', 100)
+            imuGyroNoise      = self.imu_calib.get('gyroscope_noise_density', 1.0e-3)
+            imuGyroBiasNoise  = self.imu_calib.get('gyroscope_random_walk', 1.0e-5)
+            imuAccelNoise     = self.imu_calib.get('accelerometer_noise_density', 1.0e-2)
+            imuAccelBiasNoise = self.imu_calib.get('accelerometer_random_walk', 1.0e-4)
+
+            scipy.io.savemat(
+                "vi_alignment_debug_python.mat",
+                {
+                    "swIDs": np.array(align_view_ids, dtype=float).reshape(-1, 1),
+                    "campose_R": campose_R,
+                    "campose_t": campose_t,
+                    "gyroData": gyroData,
+                    "accelData": accelData,
+                    "T_BS_R": T_BS_R,
+                    "T_BS_t": T_BS_t,
+                    "imuSampleRate": imuSampleRate,
+                    "imuGyroNoise": imuGyroNoise,
+                    "imuGyroBiasNoise": imuGyroBiasNoise,
+                    "imuAccelNoise": imuAccelNoise,
+                    "imuAccelBiasNoise": imuAccelBiasNoise,
+                },
+            )
+            print("Saved vi_alignment_debug_python.mat for MATLAB comparison.")
+
         result = initialize_visual_inertial_state(
             view_set=self.view_set,
             sliding_window=self.sw_state,
@@ -553,6 +611,19 @@ class VisualInertialOdometry():
             sensor_transform=self.T_BS,
             apply_scale_to_map=False,
         )
+
+        # --- Stash Python's own answer for MATLAB-side diffing (first attempt only) ---
+        if not hasattr(self, "_saved_python_result"):
+            self._saved_python_result = True
+            scipy.io.savemat(
+                "vi_alignment_debug_python_result.mat",
+                {
+                    "python_success": bool(result.success),
+                    "python_scale": float(result.scale),
+                    "python_gravity": np.asarray(result.gravity).reshape(1, 3),
+                    "python_accel_bias": np.asarray(result.accel_bias).reshape(1, 3),
+                },
+            )
 
         if result.success and result.scale <= MIN_USABLE_SCALE:
             # Linear system was solvable, but the recovered scale is
@@ -582,7 +653,7 @@ class VisualInertialOdometry():
             prev_id = align_view_ids[-1]
             if prev_id in self.sw_state.velocities:
                 self.sw_state.velocities[newest_id] = self.sw_state.velocities[prev_id].copy()
-
+                
     def _build_imu_preintegrations(self, view_ids):
         """
         Preintegrate IMU data between every consecutive pair of
