@@ -167,6 +167,29 @@ def camera_pose_to_body_pose(
     return R_wb, t_wb
 
 
+def body_pose_to_camera_pose(
+    R_wb: np.ndarray,
+    t_wb: np.ndarray,
+    R_bs: np.ndarray,
+    t_bs: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Inverse of camera_pose_to_body_pose: convert a body/IMU-to-world
+    pose back into the equivalent camera-to-world pose, given the
+    camera-to-body extrinsic (R_bs, t_bs) == T_BS.
+
+    From R_wb = R_wc @ R_bs.T and t_wb = t_wc - R_wb @ t_bs:
+
+        R_wc = R_wb @ R_bs
+        t_wc = t_wb + R_wb @ t_bs
+    """
+
+    R_wc = R_wb @ R_bs
+    t_wc = t_wb + R_wb @ t_bs
+
+    return R_wc, t_wc
+
+
 def _split_sensor_transform(
     sensor_transform,
 ):

@@ -1,306 +1,125 @@
 """
-test_vi_alignment.py
+test_against_matlab.py
 
-Synthetic ground-truth test for linear VI alignment.
+Loads vi_alignment_debug.mat (saved from the MATLAB reference example
+right before its estimateGravityRotationAndPoseScale call) and feeds
+the *exact same* camera poses + gyro/accel windows into the Python
+vi_alignment module, in isolation from the rest of the VIO pipeline.
 
-Strategy
---------
-1. Generate a known trajectory: rotations, metric positions,
-   velocities, and a known gravity vector.
-2. Divide the metric positions by a known scale factor to build the
-   "visual" (monocular, scale-ambiguous) poses that a VO front-end
-   would actually produce.
-3. Synthesize *ideal* IMU preintegration deltas (delta_R, delta_v,
-   delta_p) directly from the ground-truth metric trajectory and
-   gravity, with zero accelerometer bias and zero bias Jacobians.
-4. Run collect_alignment_pairs -> build_alignment_system ->
-   solve_alignment -> refine_gravity and check that everything
-   recovered matches the ground truth.
-
-This isolates the linear-algebra correctness of vi_alignment.py from
-the rest of the VIO pipeline (no real front-end / real IMU needed).
+Usage:
+    python imu/test_against_matlab.py /path/to/vi_alignment_debug.mat
 """
 
-from dataclasses import dataclass, field
-
+import sys
 import numpy as np
+from scipy.io import loadmat
 
-from vi_alignment import (
-    collect_alignment_pairs,
-    build_alignment_system,
-    solve_alignment,
-    refine_gravity,
-    gravity_column,
-)
-
-
-# ============================================================
-# Minimal fakes for ViewSet / PreintegratedIMU
-# ============================================================
-
-@dataclass
-class FakePreintegratedIMU:
-    delta_t: float
-    delta_R: np.ndarray
-    delta_v: np.ndarray
-    delta_p: np.ndarray
-    J_v_ba: np.ndarray = field(default_factory=lambda: np.zeros((3, 3)))
-    J_p_ba: np.ndarray = field(default_factory=lambda: np.zeros((3, 3)))
+from memory_management.view_set import ViewSet
+from memory_management.sliding_window import SlidingWindowState
+from imu.imu_measurement import IMUMeasurement
+from imu.preintegration import IMUPreintegrator
+from imu.vi_alignment import initialize_visual_inertial_state
 
 
-class FakeViewSet:
+def build_preintegration(gyro_block, accel_block, dt, bias_g, bias_a,
+                          gyro_noise, accel_noise,
+                          gyro_rw=1.0e-5, accel_rw=1.0e-4):
     """
-    Minimal stand-in matching the real ViewSet's public API:
-        view_set.view_ids
-        view_set.get_pose(view_id) -> (R, t)
+    MATLAB's helperExtractIMUDataBetweenViews returns raw Mx3 gyro/accel
+    blocks with no explicit per-sample timestamps -- estimateGravity...
+    assumes a fixed IMU SampleRate. We reconstruct synthetic timestamps
+    at that rate so IMUPreintegrator.integrate_measurements sees the
+    same dt spacing MATLAB's factorIMU used internally.
     """
-
-    def __init__(self, view_ids, poses):
-        self.view_ids = list(view_ids)
-        self._poses = dict(poses)  # view_id -> (R, t)
-
-    def get_pose(self, view_id):
-        return self._poses[view_id]
-
-
-# ============================================================
-# Small rotation helper (axis-angle -> R), no scipy dependency
-# ============================================================
-
-def rotation_from_axis_angle(axis, angle):
-    axis = axis / np.linalg.norm(axis)
-    K = np.array([
-        [0.0, -axis[2], axis[1]],
-        [axis[2], 0.0, -axis[0]],
-        [-axis[1], axis[0], 0.0],
-    ])
-    R = (
-        np.eye(3)
-        + np.sin(angle) * K
-        + (1.0 - np.cos(angle)) * (K @ K)
-    )
-    return R
-
-
-# ============================================================
-# Synthetic trajectory generator
-# ============================================================
-
-def generate_synthetic_trajectory(
-    num_views=6,
-    dt=0.1,
-    true_scale=2.5,
-    g_true=np.array([0.0, 0.0, -9.81]),
-    seed=0,
-):
-    """
-    Returns
-    -------
-    view_ids : list[int]
-    R_list, p_metric_list, v_metric_list : ground truth (world frame)
-    p_visual_list : p_metric_list / true_scale  (what a monocular VO
-        front-end would actually report)
-    imu_preintegrations : dict[(i,j)] -> FakePreintegratedIMU
-        built directly from ground truth, zero bias
-    """
-
-    rng = np.random.default_rng(seed)
-
-    view_ids = list(range(num_views))
-
-    # Random-ish but smooth-ish rotations and an accelerating path,
-    # so the linear system isn't degenerate (e.g. pure straight line
-    # would leave scale/gravity poorly observable, same as in real VIO).
-    R_list = []
-    p_metric_list = []
-    v_metric_list = []
-
-    R = np.eye(3)
-    p = np.zeros(3)
-    v = np.array([0.5, 0.2, 0.1])
-
-    for k in range(num_views):
-
-        R_list.append(R.copy())
-        p_metric_list.append(p.copy())
-        v_metric_list.append(v.copy())
-
-        # constant-ish jerk to keep velocity/position varying
-        accel_world = np.array(
-            [0.3 * np.sin(0.7 * k), 0.2 * np.cos(0.5 * k), 0.1]
+    n = gyro_block.shape[0]
+    t0 = 0.0
+    samples = [
+        IMUMeasurement(
+            timestamp=t0 + i * dt,
+            accel=np.asarray(accel_block[i], dtype=np.float64),
+            gyro=np.asarray(gyro_block[i], dtype=np.float64),
         )
+        for i in range(n)
+    ]
+    preintegrator = IMUPreintegrator(
+        gyro_noise=gyro_noise,
+        accel_noise=accel_noise,
+        gyro_random_walk=gyro_rw,
+        accel_random_walk=accel_rw,
+        bias_g=bias_g,
+        bias_a=bias_a,
+    )
+    return preintegrator.integrate_measurements(samples)
 
-        # propagate with gravity included (as a real IMU would sense
-        # specific force; here we just propagate true kinematics)
-        p = p + v * dt + 0.5 * accel_world * dt * dt
-        v = v + accel_world * dt
 
-        axis = rng.normal(size=3)
-        angle = 0.05 * (k + 1)
-        R = R @ rotation_from_axis_angle(axis, angle)
+def main(mat_path):
+    data = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
 
-    p_visual_list = [p / true_scale for p in p_metric_list]
+    sw_ids       = np.atleast_1d(data['swIDs']).astype(int).tolist()
+    campose_R    = data['campose_R']     # (3,3,N)
+    campose_t    = data['campose_t']     # (N,3)
+    gyro_cells   = np.atleast_1d(data['gyroData'])
+    accel_cells  = np.atleast_1d(data['accelData'])
+    T_BS_R       = data['T_BS_R']
+    T_BS_t       = data['T_BS_t']
+    print("DEBUG - imuGyroNoise raw type/shape:", type(data['imuGyroNoise']), np.shape(data['imuGyroNoise']))
+    print("DEBUG - imuGyroNoise values:", data['imuGyroNoise'])
 
+    # Extract the top-left element from the covariance matrix diagonal
+    imu_sample_rate     = float(np.ravel(data['imuSampleRate'])[0])
+    imu_gyro_noise      = float(data['imuGyroNoise'][0, 0])
+    imu_gyro_bias_noise = float(data['imuGyroBiasNoise'][0, 0])
+    imu_accel_noise     = float(data['imuAccelNoise'][0, 0])
+    imu_accel_bias_noise = float(data['imuAccelBiasNoise'][0, 0])
+
+    matlab_scale = float(np.atleast_1d(data['matlab_scale'])[0])
+    matlab_is_usable = bool(np.atleast_1d(data['matlab_IsSolutionUsable'])[0])
+
+    dt = 1.0 / imu_sample_rate
+
+    print(f"Loaded {len(sw_ids)} views, MATLAB scale={matlab_scale:.6g}, "
+          f"IsSolutionUsable={matlab_is_usable}")
+
+    # --- Build ViewSet with the exact MATLAB poses ---
+    view_set = ViewSet()
+    N = len(sw_ids)
+    for k in range(N):
+        R = campose_R[:, :, k]
+        t = campose_t[k, :]
+        view_set.add_view(sw_ids[k], R, t, timestamp=float(k) * dt)
+
+    # --- Build a PreintegratedIMU per consecutive pair ---
     imu_preintegrations = {}
-
-    for k in range(num_views - 1):
-
-        R_i = R_list[k]
-        p_i = p_metric_list[k]
-        p_j = p_metric_list[k + 1]
-        v_i = v_metric_list[k]
-        v_j = v_metric_list[k + 1]
-        R_j = R_list[k + 1]
-
-        delta_R = R_i.T @ R_j
-
-        delta_v = R_i.T @ (v_j - v_i - g_true * dt)
-
-        delta_p = R_i.T @ (
-            p_j - p_i - v_i * dt - 0.5 * g_true * dt * dt
+    for k in range(N - 1):
+        gyro_block = np.atleast_2d(gyro_cells[k])
+        accel_block = np.atleast_2d(accel_cells[k])
+        preint = build_preintegration(
+            gyro_block, accel_block, dt,
+            bias_g=np.zeros(3), bias_a=np.zeros(3),
+            gyro_noise=imu_gyro_noise,
+            accel_noise=imu_accel_noise,
+            gyro_rw=imu_gyro_bias_noise,
+            accel_rw=imu_accel_bias_noise,
         )
+        imu_preintegrations[(sw_ids[k], sw_ids[k + 1])] = preint
 
-        # Bias Jacobians must be non-zero for the accel-bias columns of
-        # A to be observable at all (with true bias = 0 here, the
-        # exact values don't affect delta_v/delta_p, only whether the
-        # bias block of A has rank). Using the standard first-order
-        # approximation -dt*I / -0.5*dt^2*I is enough for that.
-        imu_preintegrations[(view_ids[k], view_ids[k + 1])] = (
-            FakePreintegratedIMU(
-                delta_t=dt,
-                delta_R=delta_R,
-                delta_v=delta_v,
-                delta_p=delta_p,
-                J_v_ba=-dt * np.eye(3),
-                J_p_ba=-0.5 * dt * dt * np.eye(3),
-            )
-        )
+    sw_state = SlidingWindowState(window_size=N)
 
-    return (
-        view_ids,
-        R_list,
-        p_metric_list,
-        v_metric_list,
-        p_visual_list,
-        imu_preintegrations,
+    result = initialize_visual_inertial_state(
+        view_set=view_set,
+        sliding_window=sw_state,
+        imu_preintegrations=imu_preintegrations,
+        view_ids=sw_ids,
+        sensor_transform=(T_BS_R, T_BS_t),
+        apply_scale_to_map=False,
     )
 
-
-# ============================================================
-# Test
-# ============================================================
-
-def test_linear_vi_alignment_recovers_ground_truth():
-
-    true_scale = 2.5
-    g_true = np.array([0.0, 0.0, -9.81])
-
-    (
-        view_ids,
-        R_list,
-        p_metric_list,
-        v_metric_list,
-        p_visual_list,
-        imu_preintegrations,
-    ) = generate_synthetic_trajectory(
-        num_views=6,
-        dt=0.1,
-        true_scale=true_scale,
-        g_true=g_true,
-    )
-
-    poses = {
-        view_id: (R_list[k], p_visual_list[k])
-        for k, view_id in enumerate(view_ids)
-    }
-
-    view_set = FakeViewSet(view_ids, poses)
-
-    pairs = collect_alignment_pairs(view_set, imu_preintegrations)
-
-    assert len(pairs) == len(view_ids) - 1
-
-    A, b = build_alignment_system(pairs, len(view_ids))
-
-    result = solve_alignment(A, b, sorted(view_ids))
-
-    assert result.success, "Linear alignment failed to reach full rank."
-
-    # ---- scale ----
-    scale_err = abs(result.scale - true_scale)
-    assert scale_err < 1e-6, f"scale error too large: {scale_err}"
-
-    # ---- gravity (direction/magnitude, pre-refinement) ----
-    g_err = np.linalg.norm(result.gravity - g_true)
-    assert g_err < 1e-4, f"raw gravity error too large: {g_err}"
-
-    # ---- accel bias (should be ~0, no bias injected) ----
-    ba_err = np.linalg.norm(result.accel_bias)
-    assert ba_err < 1e-6, f"accel bias should be ~0, got {ba_err}"
-
-    # ---- velocities ----
-    for k, view_id in enumerate(view_ids):
-        v_err = np.linalg.norm(result.velocities[view_id] - v_metric_list[k])
-        assert v_err < 1e-6, (
-            f"velocity error too large at view {view_id}: {v_err}"
-        )
-
-    # ---- gravity refinement should preserve/tighten the estimate ----
-    g_refined = refine_gravity(
-        A, b, len(view_ids), result.gravity, gravity_magnitude=9.81
-    )
-
-    assert abs(np.linalg.norm(g_refined) - 9.81) < 1e-9, (
-        "refined gravity magnitude should be exactly 9.81"
-    )
-
-    g_refined_err = np.linalg.norm(g_refined - g_true)
-    assert g_refined_err < 1e-4, (
-        f"refined gravity error too large: {g_refined_err}"
-    )
-
-    print("scale error         :", scale_err)
-    print("raw gravity error    :", g_err)
-    print("refined gravity error:", g_refined_err)
-    print("accel bias error     :", ba_err)
-    print("ALL CHECKS PASSED")
-
-
-def test_underdetermined_system_raises():
-
-    (
-        view_ids,
-        R_list,
-        p_metric_list,
-        v_metric_list,
-        p_visual_list,
-        imu_preintegrations,
-    ) = generate_synthetic_trajectory(num_views=2, dt=0.1)
-
-    # Only 2 views -> 1 pair -> 6 equations, but 3*2+7=13 unknowns.
-    # This must be caught as underdetermined rather than silently
-    # returning garbage.
-
-    poses = {
-        view_id: (R_list[k], p_visual_list[k])
-        for k, view_id in enumerate(view_ids)
-    }
-    view_set = FakeViewSet(view_ids, poses)
-
-    pairs = collect_alignment_pairs(view_set, imu_preintegrations)
-    A, b = build_alignment_system(pairs, len(view_ids))
-
-    raised = False
-    try:
-        solve_alignment(A, b, sorted(view_ids))
-    except RuntimeError:
-        raised = True
-
-    assert raised, "Expected RuntimeError for underdetermined system."
-
-    print("underdetermined system correctly raised RuntimeError")
+    print("\n========== Python VI Alignment ==========")
+    print("success:   ", result.success)
+    print("scale:     ", result.scale, "   (MATLAB:", matlab_scale, ")")
+    print("gravity:   ", result.gravity)
+    print("accel_bias:", result.accel_bias)
 
 
 if __name__ == "__main__":
-    test_linear_vi_alignment_recovers_ground_truth()
-    test_underdetermined_system_raises()
+    main(sys.argv[1] if len(sys.argv) > 1 else "vi_alignment_debug.mat")

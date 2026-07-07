@@ -26,8 +26,21 @@ from optimization.state_update import update_state_from_graph
 from optimization.median_depth import normalize_map
 from imu.vi_alignment import (
     initialize_visual_inertial_state,
+    camera_pose_to_body_pose,
+    body_pose_to_camera_pose,
 )
 from imu.preintegration import IMUPreintegrator
+from imu.prediction import predict_state
+
+# MATLAB reference guards acceptance of the linear VI-alignment solve
+# with `info.IsSolutionUsable && scale > 1e-3` (see helperVIO.m,
+# Phase 2). solve_alignment()'s `success` flag only reflects that the
+# linear system was solvable (full rank) -- it says nothing about
+# whether the recovered scale is physically sane. A degenerate init
+# window (not enough rotation/acceleration excitation) can return a
+# full-rank solve with a negative or near-zero scale. This constant
+# mirrors MATLAB's floor so we reject those solutions the same way.
+MIN_USABLE_SCALE = 1e-3
 
 
 class VisualInertialOdometry():
@@ -541,6 +554,20 @@ class VisualInertialOdometry():
             apply_scale_to_map=False,
         )
 
+        if result.success and result.scale <= MIN_USABLE_SCALE:
+            # Linear system was solvable, but the recovered scale is
+            # not physically usable (zero, negative, or degenerate --
+            # e.g. init window didn't have enough rotation/accel
+            # excitation to separate scale from gravity/bias). MATLAB
+            # rejects this the same way (`scale > 1e-3` gate) instead
+            # of committing it. Don't latch isVI_aligned; just try
+            # again on a later frame once the window has moved on.
+            print(
+                f"[VIO] VI alignment scale not usable ({result.scale:.6g} "
+                f"<= {MIN_USABLE_SCALE}); rejecting and retrying."
+            )
+            return
+
         if result.success:
 
             print("\n========== VI Alignment ==========")
@@ -608,6 +635,37 @@ class VisualInertialOdometry():
 
         return preintegrations
 
+    def _carry_forward_previous_pose(self, frameID, timestamp):
+        """
+        Pre-alignment fallback for when PnP can't produce any pose at
+        all. There's no IMU state (scale/gravity/velocity) to fall
+        back on yet at this stage -- that's only available in Phase 3
+        (see _predict_pose_from_imu) -- so the best we can do is carry
+        the previous view's pose forward as a placeholder.
+
+        This mirrors MATLAB's behaviour of never leaving a keyframe
+        without *some* pose in the view set: `helperEstimateCameraPose`
+        always returns a currPose that gets added via `addView`, even
+        when very few/no RANSAC inliers were found. Without this, a
+        frame stays in the sliding window / feature tracks but absent
+        from view_set, which is exactly what caused
+        `KeyError: View id ... not found in ViewSet` in
+        triangulate_candidates on a later frame.
+
+        The frame is still reported as a PnP failure to the caller, so
+        triangulation/new-landmark registration is skipped for it as
+        before -- only the pose gap is fixed.
+        """
+
+        if self.view_set.num_views == 0:
+            # Nothing to carry forward from (shouldn't normally happen
+            # once map init has already added the first views).
+            return
+
+        prev_view_id = self.view_set.view_ids[-1]
+        R_prev, t_prev = self.view_set.get_pose(prev_view_id)
+        self.view_set.add_view(frameID, R_prev, t_prev, timestamp)
+
     def run_pnp(self, frameID, timestamp):
 
         correspondences = find_pnp_correspondences(
@@ -616,6 +674,7 @@ class VisualInertialOdometry():
         )
 
         if len(correspondences) < 6:
+            self._carry_forward_previous_pose(frameID, timestamp)
             return False
 
         result = solve_pnp(
@@ -624,11 +683,13 @@ class VisualInertialOdometry():
         )
 
         if result is None:
+            self._carry_forward_previous_pose(frameID, timestamp)
             return False
 
         Rwc, C, inliers = result
 
         if inliers is None or len(inliers) == 0:
+            self._carry_forward_previous_pose(frameID, timestamp)
             return False
 
         self.view_set.add_view(
@@ -779,6 +840,38 @@ class VisualInertialOdometry():
 
         return preintegrator.integrate_measurements(samples)
 
+    def _predict_pose_from_imu(self, prev_view_id, prev_velocity, preint):
+        """
+        IMU-only pose/velocity prediction, mirroring MATLAB's
+        `fIMU.predict(prevP, prevVel, prevBias)` in Phase 3.
+
+        Used as a fallback when vision (PnP / BA_motion) fails for the
+        current frame, so the frame still gets *some* pose committed
+        to view_set instead of being silently skipped -- an orphaned
+        frame that's still present in the sliding window / feature
+        tracks but missing from view_set is exactly what causes the
+        `KeyError: View id ... not found in ViewSet` crash once a
+        later frame's triangulation looks it up.
+
+        predict_state() operates in the body/IMU frame; view_set
+        stores camera-to-world poses, so we convert in and back out
+        via the T_BS extrinsic (same convention as vi_alignment.py).
+        """
+
+        R_bs = self.T_BS[:3, :3]
+        t_bs = self.T_BS[:3, 3]
+
+        R_wc_i, t_wc_i = self.view_set.get_pose(prev_view_id)
+        R_wb_i, t_wb_i = camera_pose_to_body_pose(R_wc_i, t_wc_i, R_bs, t_bs)
+
+        R_wb_j, t_wb_j, v_j = predict_state(
+            R_wb_i, t_wb_i, prev_velocity, self.sw_state.gravity, preint,
+        )
+
+        R_wc_j, t_wc_j = body_pose_to_camera_pose(R_wb_j, t_wb_j, R_bs, t_bs)
+
+        return R_wc_j, t_wc_j, v_j
+
     def visual_inertial_optimization(self, window_state, frameID, timestamp):
         """
         Phase 3 (post VI-alignment) per-frame step, up through
@@ -811,36 +904,55 @@ class VisualInertialOdometry():
             print("[VIO] No velocity estimate for previous view; skipping BA_motion.")
             return
 
-        # ---- 1. PnP pose guess for the new frame ------------------------
+        # ---- 1. IMU preintegration between previous view and this frame --
+        # Moved ahead of the vision steps: MATLAB always predicts `pp,pv`
+        # from the IMU factor before attempting BA_motion, and every
+        # vision-failure branch below now falls back to that IMU-only
+        # prediction instead of leaving frameID absent from view_set
+        # (see _predict_pose_from_imu docstring for why that matters).
+        preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
+
+        if preint is None:
+            # No IMU coverage at all for this interval -- there is
+            # nothing (vision or inertial) to anchor a pose on. This
+            # is the one case where the frame really cannot get a
+            # pose; it stays absent from view_set.
+            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
+            return
+
+        def commit_imu_fallback(reason):
+            print(f"[VIO] {reason}; falling back to IMU-only prediction.")
+            R_pred, t_pred, v_pred = self._predict_pose_from_imu(
+                prev_view_id, prev_velocity, preint,
+            )
+            self.view_set.add_view(frameID, R_pred, t_pred, timestamp)
+            self.sw_state.velocities[frameID] = v_pred
+            # Bias carries forward unchanged -- no vision/BA update
+            # available this frame to refine it.
+
+        # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
 
         if len(correspondences) < 6:
-            print("[VIO] Not enough PnP correspondences; skipping BA_motion.")
+            commit_imu_fallback("Not enough PnP correspondences")
             return
 
         pnp_result = solve_pnp(correspondences, self.K)
 
         if pnp_result is None:
-            print("[VIO] PnP failed; skipping BA_motion.")
+            commit_imu_fallback("PnP failed")
             return
 
         R_guess, C_guess, inliers = pnp_result
 
         if inliers is None or len(inliers) == 0:
-            print("[VIO] PnP found no inliers; skipping BA_motion.")
+            commit_imu_fallback("PnP found no inliers")
             return
 
         inlier_idx = inliers.flatten()
         xyz_pts = np.array([correspondences[i].xyz for i in inlier_idx])
         uv_pts = np.array([correspondences[i].uv for i in inlier_idx])
         point_ids = [correspondences[i].point_id for i in inlier_idx]
-
-        # ---- 2. IMU preintegration between previous view and this frame --
-        preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
-
-        if preint is None:
-            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
-            return
 
         prev_pose = self.view_set.get_pose(prev_view_id)
         prev_bias = (self.sw_state.gyroscope_bias, self.sw_state.accelerometer_bias)
@@ -863,12 +975,13 @@ class VisualInertialOdometry():
             preintegrated_imu=preint,
             R_bs=self.T_BS[:3, :3],
             t_bs=self.T_BS[:3, 3],
+            gravity=self.sw_state.gravity,
         )
 
         refined_pose, vel_refined, bias_refined, valid = result
 
         if refined_pose is None:
-            print("[VIO] BA_motion did not converge; skipping state update.")
+            commit_imu_fallback("BA_motion did not converge")
             return
 
         R_refined, C_refined = refined_pose
