@@ -1,3 +1,0 @@
-/home/icgel/vio/VINS/Visual_odometry/motion_estimation/bundle_adjustment/build/CMakeFiles/ba_solver.dir
-/home/icgel/vio/VINS/Visual_odometry/motion_estimation/bundle_adjustment/build/CMakeFiles/edit_cache.dir
-/home/icgel/vio/VINS/Visual_odometry/motion_estimation/bundle_adjustment/build/CMakeFiles/rebuild_cache.dir

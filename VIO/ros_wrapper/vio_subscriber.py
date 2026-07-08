@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import queue
+import traceback
 
 # Make the project root importable regardless of working directory.
 current_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -53,21 +54,21 @@ class VisualOdometryNode(Node):
         # ── Visualizer ────────────────────────────────────────────────
         self.visualizer = VOFeatureVisualizer()
 
-        # ── Backend worker thread ────────────────────────────────────
-        # Mirrors VINS-Fusion's featureBuf + processMeasurements() split:
-        # the image callback only runs the frontend (frame tracking) and
-        # hands off to this queue; a dedicated thread runs the backend
-        # (phase selection / PnP / bundle adjustment), which can block
-        # for tens of milliseconds without stalling IMU ingestion or
-        # frontend tracking on the next frame.
-        #
-        # maxsize=2, drop-oldest-on-full: if the backend falls behind
-        # the camera rate, we deliberately shed the oldest pending frame
-        # rather than let the queue (and therefore latency) grow
-        # unbounded. This is a controlled version of the frame-dropping
-        # VINS-Fusion itself does under load.
+        # Backend work queue. Unbounded and NEVER drops an item: once
+        # process_frontend() (see vio_loop_frontend) has called
+        # update_sliding_window() and committed a frame into
+        # sw_state.sliding_window_view_ids, that frame MUST eventually
+        # get a view_set.add_view() call from the backend, or later
+        # code (graph_builder.build(), triangulation, ...) will look up
+        # a view_id that's in the window but not in view_set and raise
+        # KeyError. A drop-oldest bounded queue silently violates that
+        # invariant -- it was tried here before and broke exactly this
+        # way. Bounding backend WORK (max_solver_time_in_seconds on the
+        # Ceres calls) is the correct way to keep this from growing
+        # latency unboundedly; bounding the QUEUE by dropping committed
+        # frames is not.
         self._backend_running = True
-        self._backend_queue = queue.Queue(maxsize=2)
+        self._backend_queue = queue.Queue()
         self._backend_thread = threading.Thread(
             target=self._backend_worker,
             name='vio_backend_worker',
@@ -124,22 +125,20 @@ class VisualOdometryNode(Node):
 
         window_state, frameID, ts = frontend_result
 
-        # Hand off to the backend worker thread. Drop the oldest queued
-        # item if the backend hasn't kept up, rather than blocking here
-        # or growing the queue without bound.
-        try:
-            self._backend_queue.put_nowait((window_state, frameID, ts))
-        except queue.Full:
-            try:
-                self._backend_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._backend_queue.put_nowait((window_state, frameID, ts))
-            except queue.Full:
-                # Lost a race with the worker draining the queue --
-                # harmless, just skip this frame's backend step.
-                pass
+        # Hand off to the backend worker thread. Never dropped -- see
+        # the comment on self._backend_queue's construction for why.
+        self._backend_queue.put((window_state, frameID, ts))
+
+        backlog = self._backend_queue.qsize()
+        if backlog >= 5:
+            # Not fatal, but worth knowing about: the backend is falling
+            # behind the camera rate and latency is growing. Throttled so
+            # this doesn't spam the log every frame once it's backed up.
+            self.get_logger().warn(
+                f"[VIO] Backend queue backlog: {backlog} frames pending "
+                f"(frontend at {frameID}) -- backend is falling behind.",
+                throttle_duration_sec=2.0,
+            )
 
     def _backend_worker(self):
         """
@@ -158,15 +157,19 @@ class VisualOdometryNode(Node):
             try:
                 self.vio.vio_loop_backend(window_state, frameID, ts)
             except Exception:
+                # rclpy's logger has no `exc_info` kwarg (it only accepts
+                # throttle_duration_sec / throttle_time_source_type /
+                # skip_first / once) -- format the traceback ourselves
+                # and pass it as part of the message string instead.
                 self.get_logger().error(
-                    f"[VIO backend] exception processing frame {frameID}",
-                    exc_info=True,
+                    f"[VIO backend] exception processing frame {frameID}:\n"
+                    f"{traceback.format_exc()}"
                 )
+                continue  # don't report "complete" below for a frame that errored
 
-            if frameID is not None:
-                self.get_logger().info(
-                    f"[Frame {frameID}] Backend step complete."
-                )
+            self.get_logger().info(
+                f"[Frame {frameID}] Backend step complete."
+            )
 
     def _imu_callback(self, msg: Imu):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
