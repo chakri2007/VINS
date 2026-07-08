@@ -643,12 +643,15 @@ class VisualInertialOdometry():
             T_BS_R = self.T_BS[:3, :3]
             T_BS_t = self.T_BS[:3, 3]
 
-            # IMU noise params, for parity with estimateGravityRotationAndPoseScale's IMUParameters
+            # IMU noise params, saved as NxN covariance-style matrices (diagonal here)
+            # to match MATLAB's IMUParameters convention -- estimateGravityRotation...
+            # indexes these as noiseMatrix(1,1), so a bare scalar/1x1 double would get
+            # squeezed to a 0-d value on load (squeeze_me=True) and break that indexing.
             imuSampleRate     = self.imu_calib.get('rate_hz', 100)
-            imuGyroNoise      = self.imu_calib.get('gyroscope_noise_density', 1.0e-3)
-            imuGyroBiasNoise  = self.imu_calib.get('gyroscope_random_walk', 1.0e-5)
-            imuAccelNoise     = self.imu_calib.get('accelerometer_noise_density', 1.0e-2)
-            imuAccelBiasNoise = self.imu_calib.get('accelerometer_random_walk', 1.0e-4)
+            imuGyroNoise      = np.diag([self.imu_calib.get('gyroscope_noise_density', 1.0e-3)] * 3)
+            imuGyroBiasNoise  = np.diag([self.imu_calib.get('gyroscope_random_walk', 1.0e-5)] * 3)
+            imuAccelNoise     = np.diag([self.imu_calib.get('accelerometer_noise_density', 1.0e-2)] * 3)
+            imuAccelBiasNoise = np.diag([self.imu_calib.get('accelerometer_random_walk', 1.0e-4)] * 3)
 
             scipy.io.savemat(
                 "vi_alignment_debug_python.mat",
