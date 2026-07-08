@@ -112,6 +112,7 @@ def bundle_adjustment_motion(
     max_iterations=10,
     huber_delta=1.0,
     num_threads=4,
+    max_solver_time_in_seconds=0.04,   # VINS-Mono steady-state BA_motion cap
     verbose=False,
 ):
     """
@@ -220,6 +221,7 @@ def bundle_adjustment_motion(
         verbose=verbose,
         huber_delta=huber_delta,
         num_threads=num_threads,
+        max_solver_time_in_seconds=max_solver_time_in_seconds,
     )
 
     print("\n========== BUNDLE ADJUSTMENT MOTION (Ceres) ==========")

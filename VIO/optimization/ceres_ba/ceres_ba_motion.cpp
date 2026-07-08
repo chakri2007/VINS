@@ -519,7 +519,8 @@ py::dict solve_bundle_adjustment_motion(
     int max_iterations,
     bool verbose,
     double huber_delta,
-    int num_threads
+    int num_threads,
+    double max_solver_time_in_seconds = -1.0
 ) {
     double fx = K_vec[0], fy = K_vec[1], cx = K_vec[2], cy = K_vec[3];
 
@@ -603,9 +604,23 @@ py::dict solve_bundle_adjustment_motion(
     options.minimizer_progress_to_stdout = verbose;
     options.max_num_iterations = max_iterations;
     options.num_threads = num_threads;
+    if (max_solver_time_in_seconds > 0.0) {
+        options.max_solver_time_in_seconds = max_solver_time_in_seconds;
+    }
 
     ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
+    {
+        // Release the GIL only around the actual solve -- everything
+        // before/after this still touches Python-owned objects (the
+        // std::array/py::list argument marshalling and the py::dict
+        // result construction), so the release must stay scoped tightly
+        // here. This is what lets a background worker thread run
+        // ceres::Solve() concurrently with the ROS callback thread
+        // (e.g. process_imu appending to sw_state.imu_buffer) instead
+        // of blocking the whole interpreter for the duration of the solve.
+        py::gil_scoped_release release;
+        ceres::Solve(options, &problem, &summary);
+    }
 
     if (verbose) {
         py::print(summary.BriefReport());
@@ -678,6 +693,7 @@ PYBIND11_MODULE(ceres_ba_motion, m) {
         py::arg("max_iterations") = 10,
         py::arg("verbose") = false,
         py::arg("huber_delta") = 1.0,
-        py::arg("num_threads") = 4
+        py::arg("num_threads") = 4,
+        py::arg("max_solver_time_in_seconds") = -1.0
     );
 }

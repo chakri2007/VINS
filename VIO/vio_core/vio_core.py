@@ -1,3 +1,5 @@
+import threading
+
 import cv2
 import numpy as np
 
@@ -119,64 +121,109 @@ class VisualInertialOdometry():
 
         self.bundle_adjustment = None
 
+        # Guards sw_state / view_set mutations once vio_loop_frontend()
+        # (ROS callback thread) and vio_loop_backend() (dedicated worker
+        # thread) can run concurrently -- see vio_subscriber.py. process_imu
+        # (callback thread) and the backend's IMU-buffer reads/prunes
+        # (worker thread) are the most frequent point of overlap, but this
+        # lock is taken generously around any shared-state mutation rather
+        # than reasoned about per-field.
+        self.state_lock = threading.RLock()
 
-    def vio_loop(self, raw_img_frame, timestamp):
 
-        self.frameID += 1
+    def vio_loop_frontend(self, raw_img_frame, timestamp):
+        """
+        Frontend-only step -- intended to run on the ROS image-callback
+        thread. Mirrors VINS-Fusion's Estimator::inputImage(): KLT
+        tracking, RANSAC outlier rejection, and new-feature detection
+        happen here, synchronously, because they're bounded and cheap
+        (milliseconds). Nothing here touches the optimizer.
 
-        # self.img_frame, self.K = preprocess_image(
-        #     raw_img_frame,
-        #     self.distortion_coeffs,
-        #     self.K_raw,
-        #     self.params,
-        # 
-        self.img_frame = raw_img_frame.copy()
+        Returns None on the first frame (nothing to hand to the backend
+        yet), otherwise (window_state, frameID, timestamp) to be pushed
+        onto the backend's work queue by the caller.
+        """
 
-        #
-        # First frame
-        #
-        if self.isFirstFrame:
-            self._init_first_frame(
+        with self.state_lock:
+            self.frameID += 1
+
+            # self.img_frame, self.K = preprocess_image(
+            #     raw_img_frame,
+            #     self.distortion_coeffs,
+            #     self.K_raw,
+            #     self.params,
+            #
+            self.img_frame = raw_img_frame.copy()
+
+            if self.isFirstFrame:
+                self._init_first_frame(
+                    self.img_frame,
+                    self.frameID,
+                    timestamp,
+                )
+                return None
+
+            window_state = self.process_frontend(
                 self.img_frame,
                 self.frameID,
-                timestamp,
             )
+
+            return (window_state, self.frameID, timestamp)
+
+    def vio_loop_backend(self, window_state, frameID, timestamp):
+        """
+        Backend-only step -- intended to run on a dedicated worker
+        thread, fed from a queue by the caller. Mirrors VINS-Fusion's
+        Estimator::processMeasurements(): IMU preintegration, phase
+        selection, PnP, and bundle adjustment all happen here. This is
+        the piece that can legitimately block for tens of milliseconds
+        without stalling frontend tracking or IMU ingestion, PROVIDED
+        the Ceres bindings release the GIL during Solve() (see
+        ceres_ba.cpp / ceres_ba_motion.cpp).
+        """
+
+        with self.state_lock:
+            if not self.isMapInitialized:
+
+                self.vio_initialization(
+                    window_state,
+                    frameID,
+                    timestamp,
+                )
+
+            elif not self.isVI_aligned:
+
+                self.VI_alignment(
+                    window_state,
+                    frameID,
+                    timestamp,
+                )
+
+            else:
+
+                self.visual_inertial_optimization(
+                    window_state,
+                    frameID,
+                    timestamp,
+                )
+
+    def vio_loop(self, raw_img_frame, timestamp):
+        """
+        Synchronous convenience wrapper (single-threaded use, e.g.
+        offline batch processing over a rosbag/dataset where there's no
+        callback-thread/worker-thread split to preserve). Equivalent to
+        running vio_loop_frontend() immediately followed by
+        vio_loop_backend() on the same thread -- this is what every call
+        did before the frontend/backend split. Do NOT call this from the
+        ROS node; use vio_loop_frontend()/vio_loop_backend() there
+        instead (see vio_subscriber.py).
+        """
+
+        item = self.vio_loop_frontend(raw_img_frame, timestamp)
+        if item is None:
             return
-
-        #
-        # Common frontend
-        #
-        window_state = self.process_frontend(
-            self.img_frame,
-            self.frameID,
-        )
-
-        #
-        # Phase selection
-        #
-        if not self.isMapInitialized:
-
-            self.vio_initialization(
-                window_state,
-                self.frameID,
-                timestamp,
-            )
-
-        elif not self.isVI_aligned:
-
-            self.VI_alignment(
-                window_state,
-                self.frameID,
-                timestamp,
-            )
-
-        else:
-
-            self.visual_inertial_optimization(
-                window_state,
-                self.frameID,
-                timestamp,
-            )
+        window_state, frameID, ts = item
+        self.vio_loop_backend(window_state, frameID, ts)
 
     def process_frame_mono(self, raw_img_frame, img_frame_timestamp):
         self.vio_loop(raw_img_frame, img_frame_timestamp)
@@ -865,14 +912,15 @@ class VisualInertialOdometry():
         dropped from the sliding window.
         """
 
-        append_imu_measurement(
-            self.sw_state,
-            IMUMeasurement(
-                timestamp=timestamp,
-                accel=np.asarray(accel, dtype=np.float64),
-                gyro=np.asarray(gyro, dtype=np.float64),
-            ),
-        )
+        with self.state_lock:
+            append_imu_measurement(
+                self.sw_state,
+                IMUMeasurement(
+                    timestamp=timestamp,
+                    accel=np.asarray(accel, dtype=np.float64),
+                    gyro=np.asarray(gyro, dtype=np.float64),
+                ),
+            )
     def _build_single_imu_preintegration(self, from_view_id, to_view_id, to_timestamp):
         """
         Preintegrate IMU samples between an existing view (from_view_id,

@@ -7,6 +7,8 @@ import numpy as np
 from cv_bridge import CvBridge
 import os
 import sys
+import threading
+import queue
 
 # Make the project root importable regardless of working directory.
 current_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +53,28 @@ class VisualOdometryNode(Node):
         # ── Visualizer ────────────────────────────────────────────────
         self.visualizer = VOFeatureVisualizer()
 
+        # ── Backend worker thread ────────────────────────────────────
+        # Mirrors VINS-Fusion's featureBuf + processMeasurements() split:
+        # the image callback only runs the frontend (frame tracking) and
+        # hands off to this queue; a dedicated thread runs the backend
+        # (phase selection / PnP / bundle adjustment), which can block
+        # for tens of milliseconds without stalling IMU ingestion or
+        # frontend tracking on the next frame.
+        #
+        # maxsize=2, drop-oldest-on-full: if the backend falls behind
+        # the camera rate, we deliberately shed the oldest pending frame
+        # rather than let the queue (and therefore latency) grow
+        # unbounded. This is a controlled version of the frame-dropping
+        # VINS-Fusion itself does under load.
+        self._backend_running = True
+        self._backend_queue = queue.Queue(maxsize=2)
+        self._backend_thread = threading.Thread(
+            target=self._backend_worker,
+            name='vio_backend_worker',
+            daemon=True,
+        )
+        self._backend_thread.start()
+
         # ── Camera subscriber ─────────────────────────────────────────
         camera_topic = self.ros_config.get('left_camera_topic', '/camera/image_raw')
         if self.mode == 'mono':
@@ -78,21 +102,71 @@ class VisualOdometryNode(Node):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         cv_image  = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
-        result = self.vio.process_frame_mono(cv_image, timestamp)
+        # Frontend only: KLT tracking + RANSAC + new-feature detection.
+        # Stays on this (callback) thread -- bounded/cheap, same as
+        # VINS-Fusion's trackImage() call inside inputImage().
+        frontend_result = self.vio.vio_loop_frontend(cv_image, timestamp)
 
-        # Publish annotated feature-track image.
+        # Publish annotated feature-track image immediately -- this only
+        # needs the frontend's tracks, not the backend's pose/BA result.
         self.visualizer.publish_feature_tracks(
             cv_image,
             timestamp,
-            result['tracks'],
-            result['K'],
-            result['D'],
+            self.vio.get_active_tracks(),
+            self.vio.K,
+            self.vio.distortion_coeffs,
         )
 
-        if result.get('pose') is not None:
-            self.get_logger().info(
-                f"[Frame {self.vio.frameID}] Pose available."
-            )
+        if frontend_result is None:
+            # First frame -- _init_first_frame() already handled it,
+            # nothing to hand off to the backend yet.
+            return
+
+        window_state, frameID, ts = frontend_result
+
+        # Hand off to the backend worker thread. Drop the oldest queued
+        # item if the backend hasn't kept up, rather than blocking here
+        # or growing the queue without bound.
+        try:
+            self._backend_queue.put_nowait((window_state, frameID, ts))
+        except queue.Full:
+            try:
+                self._backend_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._backend_queue.put_nowait((window_state, frameID, ts))
+            except queue.Full:
+                # Lost a race with the worker draining the queue --
+                # harmless, just skip this frame's backend step.
+                pass
+
+    def _backend_worker(self):
+        """
+        Dedicated thread: pulls (window_state, frameID, timestamp) off
+        the queue and runs the backend (phase selection / PnP / bundle
+        adjustment). Mirrors VINS-Fusion's Estimator::processMeasurements()
+        loop. Blocks freely on Ceres solves here -- that's the whole
+        point of this thread existing.
+        """
+        while self._backend_running:
+            try:
+                window_state, frameID, ts = self._backend_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                self.vio.vio_loop_backend(window_state, frameID, ts)
+            except Exception:
+                self.get_logger().error(
+                    f"[VIO backend] exception processing frame {frameID}",
+                    exc_info=True,
+                )
+
+            if frameID is not None:
+                self.get_logger().info(
+                    f"[Frame {frameID}] Backend step complete."
+                )
 
     def _imu_callback(self, msg: Imu):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -138,6 +212,8 @@ class VisualOdometryNode(Node):
         return calib
 
     def destroy_node(self):
+        self._backend_running = False
+        self._backend_thread.join(timeout=2.0)
         self.vio.feature_extractor.shutdown()
         super().destroy_node()
 

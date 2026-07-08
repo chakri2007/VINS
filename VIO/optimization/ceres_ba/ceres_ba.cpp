@@ -212,7 +212,17 @@ py::dict solve_bundle_adjustment(
     }
 
     ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
+    {
+        // Scoped tightly around just the solve -- everything before/after
+        // still touches Python-owned objects (argument marshalling into
+        // std::map/std::array, and the py::dict result construction), so
+        // the release can't cover the whole function body. This is what
+        // lets a background worker thread run ceres::Solve() concurrently
+        // with the ROS callback thread instead of blocking the whole
+        // interpreter for the duration of the solve.
+        py::gil_scoped_release release;
+        ceres::Solve(options, &problem, &summary);
+    }
 
     if (verbose) {
         py::print(summary.BriefReport());
