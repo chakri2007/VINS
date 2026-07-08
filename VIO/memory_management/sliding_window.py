@@ -116,7 +116,7 @@ def quick_check_parallax(m1: np.ndarray, m2: np.ndarray, parallax_threshold: flo
     return avg, bool(avg > parallax_threshold)
 
 
-def update_sliding_window(
+def update_tracks(
     state: SlidingWindowState,
     image_shape,
     curr_points_tracked: np.ndarray,
@@ -126,29 +126,26 @@ def update_sliding_window(
     F_iterations: int,
     F_confidence: float,
     F_threshold: float,
-    key_frame_parallax: float,
     fundamental_matrix_ransac_fn: Optional[Callable] = None,
 ):
+    """
+    Frame-local half of what used to be update_sliding_window: RANSAC
+    outlier rejection against the previously-stored view, plus writing
+    this frame's observations/ids/track-count/current_view_id.
+
+    Safe to call on the ROS callback thread, ahead of however far
+    backend has gotten: it only ever reads/writes per-view entries
+    (all_observations[view_id], all_ids[view_id], ...) and the
+    single current_view_id continuity pointer. It never touches
+    sliding_window_view_ids, so it cannot race with
+    update_window_membership() below, which is the only thing allowed
+    to mutate window membership -- and which must run on the backend
+    thread, strictly in frame order, for exactly that reason.
+    """
+
     if fundamental_matrix_ransac_fn is None:
         fundamental_matrix_ransac_fn = estimate_fundamental_matrix_ransac
 
-    window_state = {
-        "isEnoughParallax": False,
-        "isWindowFull":     False,
-        "isFirstFewViews":  False,
-    }
-
-    # ── very first frame ─────────────────────────────────────────────────
-    if state.current_sliding_window_index == 0:
-        state.current_sliding_window_index = 1
-        state.sliding_window_view_ids.append(view_id)
-        # observations/ids were already written by the caller (_init_first_frame)
-        state.current_view_id = view_id
-        return -1, window_state
-
-    # ── RANSAC outlier rejection ──────────────────────────────────────────
-    # prev_obs must come from the LAST STORED view, not blindly view_id-1,
-    # because a replaced (non-KF) frame may not be at view_id-1.
     prev_stored_id = state.current_view_id
     prev_obs       = state.all_observations[prev_stored_id]
 
@@ -189,12 +186,47 @@ def update_sliding_window(
     ) if len(p_ids) > 0 else np.empty((0, 2), dtype=np.int64)
     state.current_view_id   = view_id
 
-    # default: oldest window slot (overwritten in every branch below)
-    removed_frame_id = state.sliding_window_view_ids[0]
+
+def update_window_membership(
+    state: SlidingWindowState,
+    view_id: int,
+    key_frame_parallax: float,
+):
+    """
+    Backend-only half of what used to be update_sliding_window: decides
+    whether `view_id` (already written by update_tracks, above) joins
+    sliding_window_view_ids, replaces a non-keyframe slot, or gets
+    evicted, and updates keyframe flags accordingly.
+
+    MUST run on the backend thread, and only ever in the same order
+    backend consumes frames from its queue (FIFO) — this function is
+    the sole mutator of sliding_window_view_ids / is_key_frame /
+    current_sliding_window_index, and every decision it makes depends
+    on the state left by the immediately preceding call. Running it
+    out of order, or concurrently with itself from two threads, will
+    corrupt the window the same way running it ahead of view_set
+    commits did before this split.
+    """
+
+    window_state = {
+        "isEnoughParallax": False,
+        "isWindowFull":     False,
+        "isFirstFewViews":  False,
+    }
+
+    # ── very first frame ─────────────────────────────────────────────────
+    if state.current_sliding_window_index == 0:
+        state.current_sliding_window_index = 1
+        state.sliding_window_view_ids.append(view_id)
+        state.current_view_id = view_id
+        return -1, window_state
 
     no_move_window = 0.5
     warmup_cutoff  = int(np.floor(state.window_size * no_move_window))
     idx            = state.current_sliding_window_index   # alias, easier to read
+
+    # default: oldest window slot (overwritten in every branch below)
+    removed_frame_id = state.sliding_window_view_ids[0]
 
     # ── branch 1: warm-up ────────────────────────────────────────────────
     if (idx < warmup_cutoff and state.no_movement_at_start) or (idx < 2):

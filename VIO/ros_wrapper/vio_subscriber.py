@@ -123,11 +123,11 @@ class VisualOdometryNode(Node):
             # nothing to hand off to the backend yet.
             return
 
-        window_state, frameID, ts = frontend_result
+        frameID, ts = frontend_result
 
         # Hand off to the backend worker thread. Never dropped -- see
         # the comment on self._backend_queue's construction for why.
-        self._backend_queue.put((window_state, frameID, ts))
+        self._backend_queue.put((frameID, ts))
 
         backlog = self._backend_queue.qsize()
         if backlog >= 5:
@@ -142,20 +142,25 @@ class VisualOdometryNode(Node):
 
     def _backend_worker(self):
         """
-        Dedicated thread: pulls (window_state, frameID, timestamp) off
-        the queue and runs the backend (phase selection / PnP / bundle
-        adjustment). Mirrors VINS-Fusion's Estimator::processMeasurements()
-        loop. Blocks freely on Ceres solves here -- that's the whole
-        point of this thread existing.
+        Dedicated thread: pulls (frameID, timestamp) off the queue,
+        strictly FIFO, and runs the backend (window-membership decision
+        + phase selection / PnP / bundle adjustment). Mirrors
+        VINS-Fusion's Estimator::processMeasurements() loop. Blocks
+        freely on Ceres solves here -- that's the whole point of this
+        thread existing. FIFO order matters: update_window_membership()
+        (called inside vio_loop_backend) is only safe because this is
+        the one place, in this one thread, that frames are ever
+        finalized into the window, always in the order they were
+        queued.
         """
         while self._backend_running:
             try:
-                window_state, frameID, ts = self._backend_queue.get(timeout=0.5)
+                frameID, ts = self._backend_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
             try:
-                self.vio.vio_loop_backend(window_state, frameID, ts)
+                self.vio.vio_loop_backend(frameID, ts)
             except Exception:
                 # rclpy's logger has no `exc_info` kwarg (it only accepts
                 # throttle_duration_sec / throttle_time_source_type /

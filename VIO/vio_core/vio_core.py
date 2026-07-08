@@ -10,7 +10,8 @@ from feature_manager.feature_extractor import FeatureExtractor
 from memory_management.view_set import ViewSet
 from memory_management.sliding_window import (
     SlidingWindowState,
-    update_sliding_window,
+    update_tracks,
+    update_window_membership,
     append_imu_measurement,
     extract_imu_between,
     prune_imu_before,
@@ -135,13 +136,22 @@ class VisualInertialOdometry():
         """
         Frontend-only step -- intended to run on the ROS image-callback
         thread. Mirrors VINS-Fusion's Estimator::inputImage(): KLT
-        tracking, RANSAC outlier rejection, and new-feature detection
-        happen here, synchronously, because they're bounded and cheap
-        (milliseconds). Nothing here touches the optimizer.
+        tracking, RANSAC outlier rejection, grid-based eviction, and
+        new-feature detection happen here, synchronously, because
+        they're bounded, cheap, and -- critically -- entirely
+        per-view: process_frontend() only ever reads/writes
+        all_observations[frameID]/all_ids[frameID]/current_view_id, and
+        never touches sliding_window_view_ids. That means frontend is
+        free to run arbitrarily far ahead of backend without racing it.
+
+        Window MEMBERSHIP (which frames sit in sliding_window_view_ids,
+        keyframe status, eviction) is decided in vio_loop_backend
+        instead, not here -- see update_window_membership() in
+        sliding_window.py for why that split matters.
 
         Returns None on the first frame (nothing to hand to the backend
-        yet), otherwise (window_state, frameID, timestamp) to be pushed
-        onto the backend's work queue by the caller.
+        yet), otherwise (frameID, timestamp) to be pushed onto the
+        backend's work queue by the caller.
         """
 
         with self.state_lock:
@@ -163,26 +173,48 @@ class VisualInertialOdometry():
                 )
                 return None
 
-            window_state = self.process_frontend(
+            self.process_frontend(
                 self.img_frame,
                 self.frameID,
             )
 
-            return (window_state, self.frameID, timestamp)
+            return (self.frameID, timestamp)
 
-    def vio_loop_backend(self, window_state, frameID, timestamp):
+    def vio_loop_backend(self, frameID, timestamp):
         """
         Backend-only step -- intended to run on a dedicated worker
-        thread, fed from a queue by the caller. Mirrors VINS-Fusion's
-        Estimator::processMeasurements(): IMU preintegration, phase
-        selection, PnP, and bundle adjustment all happen here. This is
-        the piece that can legitimately block for tens of milliseconds
-        without stalling frontend tracking or IMU ingestion, PROVIDED
-        the Ceres bindings release the GIL during Solve() (see
-        ceres_ba.cpp / ceres_ba_motion.cpp).
+        thread, fed from a FIFO queue by the caller. Mirrors
+        VINS-Fusion's Estimator::processMeasurements(): window
+        membership, IMU preintegration, phase selection, PnP, and
+        bundle adjustment all happen here, strictly in the order
+        frames were queued.
+
+        update_window_membership() is called here rather than in
+        vio_loop_frontend() specifically because it's the sole mutator
+        of sliding_window_view_ids, and every decision it makes depends
+        on the state left by the call for the previous frame. Since
+        this method only ever runs from the one backend worker thread,
+        pulling frames off a FIFO queue in order, that ordering
+        guarantee holds automatically -- it would not if this call sat
+        in the frontend, racing ahead of however far backend has
+        actually gotten (that was the KeyError bug: a frame entering
+        the window before view_set had committed a pose for it).
         """
 
         with self.state_lock:
+            removed_frame_id, window_state = update_window_membership(
+                state               = self.sw_state,
+                view_id             = frameID,
+                key_frame_parallax  = self.params['keyFrameParallax'],
+            )
+
+            if (removed_frame_id >= 0
+                    and len(self.sw_state.sliding_window_view_ids) > 0
+                    and removed_frame_id > self.sw_state.sliding_window_view_ids[0]):
+                self.removed_frame_ids.append(removed_frame_id)
+
+            self._prune_imu_buffer()
+
             if not self.isMapInitialized:
 
                 self.vio_initialization(
@@ -222,8 +254,8 @@ class VisualInertialOdometry():
         item = self.vio_loop_frontend(raw_img_frame, timestamp)
         if item is None:
             return
-        window_state, frameID, ts = item
-        self.vio_loop_backend(window_state, frameID, ts)
+        frameID, ts = item
+        self.vio_loop_backend(frameID, ts)
 
     def process_frame_mono(self, raw_img_frame, img_frame_timestamp):
         self.vio_loop(raw_img_frame, img_frame_timestamp)
@@ -248,18 +280,15 @@ class VisualInertialOdometry():
         for pid in point_ids:
             self.sw_state.key_point_track_count[pid] = 1
 
-        # update_sliding_window first-frame branch just registers the view_id
-        # and sets current_view_id = frameID.
-        update_sliding_window(
+        # First-frame registration: append into sliding_window_view_ids and
+        # set current_view_id. This is the one place window membership is
+        # decided outside vio_loop_backend, but it's inherently safe: it
+        # runs synchronously before the frontend/backend split even starts
+        # (isFirstFrame short-circuits vio_loop_frontend, nothing is queued
+        # for backend yet), so there's no ordering hazard here.
+        update_window_membership(
             state               = self.sw_state,
-            image_shape         = img_frame.shape,
-            curr_points_tracked = features,
-            valid_idx           = np.ones(num_pts, dtype=bool),
             view_id             = frameID,
-            F_loop              = self.params['F_loop'],
-            F_iterations        = self.params['F_Iterations'],
-            F_confidence        = self.params['F_Confidence'],
-            F_threshold         = self.params['F_Threshold'],
             key_frame_parallax  = self.params['keyFrameParallax'],
         )
 
@@ -281,10 +310,11 @@ class VisualInertialOdometry():
         )
         valid_idx = status.astype(bool)   # same length as prev_points
 
-
-        # Pass full, unfiltered arrays — sliding_window does its own
-        # v1 = valid_idx & ps_idx filtering internally.
-        removed_frame_id, window_state = update_sliding_window(
+        # RANSAC outlier rejection + write this frame's observations/ids +
+        # current_view_id continuity. Frame-local only -- does NOT decide
+        # window membership (see update_window_membership, called from
+        # vio_loop_backend instead).
+        update_tracks(
             state               = self.sw_state,
             image_shape         = img_frame.shape,
             curr_points_tracked = tracked_points,
@@ -294,7 +324,6 @@ class VisualInertialOdometry():
             F_iterations        = self.params['F_Iterations'],
             F_confidence        = self.params['F_Confidence'],
             F_threshold         = self.params['F_Threshold'],
-            key_frame_parallax  = self.params['keyFrameParallax'],
         )
 
         # ── grid-based eviction on RANSAC survivors ───────────────────────
@@ -327,12 +356,6 @@ class VisualInertialOdometry():
                 if tri is not None and len(tri) == len(keep):
                     self.sw_state.all_triangulated[frameID] = tri[keep]
 
-        # ── track removed frame ids ───────────────────────────────────────
-        if (removed_frame_id >= 0
-                and len(self.sw_state.sliding_window_view_ids) > 0
-                and removed_frame_id > self.sw_state.sliding_window_view_ids[0]):
-            self.removed_frame_ids.append(removed_frame_id)
-
         # ── detect new features in sparse grid cells ──────────────────────
         new_pts = self.feature_extractor.extract_features_in_empty_cells(
             img_frame, post_pts
@@ -359,10 +382,6 @@ class VisualInertialOdometry():
             ])
 
         self.prev_img_frame = img_frame
-
-        self._prune_imu_buffer()
-
-        return window_state
 
     def _prune_imu_buffer(self):
         """
@@ -624,12 +643,15 @@ class VisualInertialOdometry():
             T_BS_R = self.T_BS[:3, :3]
             T_BS_t = self.T_BS[:3, 3]
 
-            # IMU noise params, for parity with estimateGravityRotationAndPoseScale's IMUParameters
+            # IMU noise params, saved as NxN covariance-style matrices (diagonal here)
+            # to match MATLAB's IMUParameters convention -- estimateGravityRotation...
+            # indexes these as noiseMatrix(1,1), so a bare scalar/1x1 double would get
+            # squeezed to a 0-d value on load (squeeze_me=True) and break that indexing.
             imuSampleRate     = self.imu_calib.get('rate_hz', 100)
-            imuGyroNoise      = self.imu_calib.get('gyroscope_noise_density', 1.0e-3)
-            imuGyroBiasNoise  = self.imu_calib.get('gyroscope_random_walk', 1.0e-5)
-            imuAccelNoise     = self.imu_calib.get('accelerometer_noise_density', 1.0e-2)
-            imuAccelBiasNoise = self.imu_calib.get('accelerometer_random_walk', 1.0e-4)
+            imuGyroNoise      = np.diag([self.imu_calib.get('gyroscope_noise_density', 1.0e-3)] * 3)
+            imuGyroBiasNoise  = np.diag([self.imu_calib.get('gyroscope_random_walk', 1.0e-5)] * 3)
+            imuAccelNoise     = np.diag([self.imu_calib.get('accelerometer_noise_density', 1.0e-2)] * 3)
+            imuAccelBiasNoise = np.diag([self.imu_calib.get('accelerometer_random_walk', 1.0e-4)] * 3)
 
             scipy.io.savemat(
                 "vi_alignment_debug_python.mat",
