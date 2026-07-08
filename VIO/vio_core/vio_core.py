@@ -611,12 +611,40 @@ class VisualInertialOdometry():
             # run alignment yet.
             return
 
-        # --- Debug dump for MATLAB comparison (first attempt only) ---
-        if not hasattr(self, "_saved_alignment_debug_data"):
+        result = initialize_visual_inertial_state(
+            view_set=self.view_set,
+            sliding_window=self.sw_state,
+            imu_preintegrations=imu_preintegrations,
+            view_ids=align_view_ids,
+            sensor_transform=self.T_BS,
+            apply_scale_to_map=False,
+        )
+
+        # --- Debug dump for MATLAB comparison ---
+        #
+        # Saved on the call that actually latches isVI_aligned (i.e. the
+        # SUCCESSFUL alignment), not on the first attempt. try_vi_alignment()
+        # runs on every incoming frame until isVI_aligned latches True, and
+        # the sliding window keeps moving forward in between -- dumping on
+        # the first attempt captured an early, degenerate bootstrap window
+        # (placeholder identity poses from _carry_forward_previous_pose,
+        # near-zero baseline pairs) that has nothing to do with the window
+        # that eventually succeeds. Gating the dump on `result.success and
+        # result.scale > MIN_USABLE_SCALE` -- the same acceptance condition
+        # used below -- guarantees the .mat file matches the window behind
+        # the printed "VI Alignment" success log.
+        #
+        # Real per-sample IMU timestamps are now included (imu_timestamps,
+        # one array per interval, parallel to gyroData/accelData) instead of
+        # forcing vi_align_test.py to fabricate them at an assumed fixed
+        # rate restarting at t0=0 -- that assumption doesn't hold for
+        # intervals with few, irregularly-timed samples.
+        if (not hasattr(self, "_saved_alignment_debug_data")
+                and result.success
+                and result.scale > MIN_USABLE_SCALE):
             self._saved_alignment_debug_data = True
 
             import scipy.io
-            from memory_management.sliding_window import extract_imu_between
 
             N = len(align_view_ids)
 
@@ -629,15 +657,21 @@ class VisualInertialOdometry():
                 campose_t[k, :] = t
 
             # Raw IMU between each consecutive pair (NOT preintegrated --
-            # MATLAB's estimateGravityRotationAndPoseScale wants raw samples)
+            # MATLAB's estimateGravityRotationAndPoseScale wants raw samples),
+            # plus each sample's real timestamp so the test harness doesn't
+            # have to assume a fixed sample rate.
             gyroData = np.empty((1, N - 1), dtype=object)
             accelData = np.empty((1, N - 1), dtype=object)
+            imuTimestamps = np.empty((1, N - 1), dtype=object)
             for k, (i, j) in enumerate(zip(align_view_ids[:-1], align_view_ids[1:])):
                 t_i = self.view_set.get_timestamp(i)
                 t_j = self.view_set.get_timestamp(j)
                 samples = extract_imu_between(self.sw_state, t_i, t_j)
                 gyroData[0, k] = np.vstack([m.gyro for m in samples])
                 accelData[0, k] = np.vstack([m.accel for m in samples])
+                imuTimestamps[0, k] = np.array(
+                    [m.timestamp for m in samples], dtype=float
+                ).reshape(-1, 1)
 
             # Camera->IMU extrinsic (T_BS)
             T_BS_R = self.T_BS[:3, :3]
@@ -661,6 +695,7 @@ class VisualInertialOdometry():
                     "campose_t": campose_t,
                     "gyroData": gyroData,
                     "accelData": accelData,
+                    "imuTimestamps": imuTimestamps,
                     "T_BS_R": T_BS_R,
                     "T_BS_t": T_BS_t,
                     "imuSampleRate": imuSampleRate,
@@ -670,20 +705,9 @@ class VisualInertialOdometry():
                     "imuAccelBiasNoise": imuAccelBiasNoise,
                 },
             )
-            print("Saved vi_alignment_debug_python.mat for MATLAB comparison.")
+            print("Saved vi_alignment_debug_python.mat for MATLAB comparison "
+                  "(successful alignment window).")
 
-        result = initialize_visual_inertial_state(
-            view_set=self.view_set,
-            sliding_window=self.sw_state,
-            imu_preintegrations=imu_preintegrations,
-            view_ids=align_view_ids,
-            sensor_transform=self.T_BS,
-            apply_scale_to_map=False,
-        )
-
-        # --- Stash Python's own answer for MATLAB-side diffing (first attempt only) ---
-        if not hasattr(self, "_saved_python_result"):
-            self._saved_python_result = True
             scipy.io.savemat(
                 "vi_alignment_debug_python_result.mat",
                 {
