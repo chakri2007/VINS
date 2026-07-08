@@ -22,9 +22,20 @@ def estimate_median_depth(
     depths = []
 
     #
-    # Use the newest camera in the window
+    # Use the newest camera in the window. NOTE: this must be
+    # sliding_window_state.sliding_window_view_ids[-1] (the last frame
+    # backend has actually finalized into the window), NOT
+    # sliding_window_state.current_view_id. current_view_id is a
+    # frontend-thread tracking-continuity cursor (see update_tracks() in
+    # sliding_window.py) that's deliberately allowed to run ahead of
+    # backend -- by the time this function runs, it may already point
+    # at a frame whose view_set.add_view() hasn't happened yet, which
+    # raises exactly the KeyError this comment is here to prevent.
+    # sliding_window_view_ids[-1] is only ever mutated by
+    # update_window_membership() on the backend thread, in the same
+    # call that led here, so it's always safely committed.
     #
-    current_view = sliding_window_state.current_view_id
+    current_view = sliding_window_state.sliding_window_view_ids[-1]
 
     R, t = view_set.get_pose(current_view)
 

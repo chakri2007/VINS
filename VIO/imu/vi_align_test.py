@@ -72,13 +72,21 @@ def main(mat_path):
     imu_accel_noise     = float(data['imuAccelNoise'][0, 0])
     imu_accel_bias_noise = float(data['imuAccelBiasNoise'][0, 0])
 
-    matlab_scale = float(np.atleast_1d(data['matlab_scale'])[0])
-    matlab_is_usable = bool(np.atleast_1d(data['matlab_IsSolutionUsable'])[0])
+    if 'matlab_scale' in data:
+        matlab_scale = float(np.atleast_1d(data['matlab_scale'])[0])
+        matlab_is_usable = bool(np.atleast_1d(data['matlab_IsSolutionUsable'])[0])
+        print(f"Loaded {len(sw_ids)} views, MATLAB scale={matlab_scale:.6g}, "
+            f"IsSolutionUsable={matlab_is_usable}")
+    else:
+        matlab_scale = None
+        matlab_is_usable = None
+        print(f"Loaded {len(sw_ids)} views (no MATLAB reference present in this .mat)")
+
+    
 
     dt = 1.0 / imu_sample_rate
 
-    print(f"Loaded {len(sw_ids)} views, MATLAB scale={matlab_scale:.6g}, "
-          f"IsSolutionUsable={matlab_is_usable}")
+    
 
     # --- Build ViewSet with the exact MATLAB poses ---
     view_set = ViewSet()
@@ -116,7 +124,8 @@ def main(mat_path):
 
     print("\n========== Python VI Alignment ==========")
     print("success:   ", result.success)
-    print("scale:     ", result.scale, "   (MATLAB:", matlab_scale, ")")
+    print("scale:     ", result.scale,
+      "   (MATLAB:", matlab_scale if matlab_scale is not None else "N/A", ")")
     print("gravity:   ", result.gravity)
     print("accel_bias:", result.accel_bias)
 
