@@ -1063,9 +1063,11 @@ class VisualInertialOdometry():
         preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
 
         if preint is None:
-            print("[VIO] Insufficient IMU coverage; carrying forward previous pose.")
+            print("[VIO] Insufficient IMU coverage; extrapolating with constant velocity.")
             R_prev, t_prev = self.view_set.get_pose(prev_view_id)
-            self.view_set.add_view(frameID, R_prev, t_prev, timestamp)
+            dt = timestamp - self.view_set.get_timestamp(prev_view_id)
+            t_pred = t_prev + prev_velocity * dt   # world-frame constant-velocity guess
+            self.view_set.add_view(frameID, R_prev, t_pred, timestamp)
             self.sw_state.velocities[frameID] = prev_velocity
             prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
             self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
