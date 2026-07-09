@@ -19,6 +19,8 @@ if project_root not in sys.path:
 
 from vio_core.vio_core import VisualInertialOdometry
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
+from ros_wrapper.vio_publisher import VIOOdometryPublisher
+from imu.vi_alignment import camera_pose_to_body_pose
 
 
 class VisualOdometryNode(Node):
@@ -53,6 +55,13 @@ class VisualOdometryNode(Node):
 
         # ── Visualizer ────────────────────────────────────────────────
         self.visualizer = VOFeatureVisualizer()
+
+        # ── Odometry publisher (nav_msgs/Odometry + TF) ────────────────
+        # Separate rclpy.Node instance -- only used for its publisher/
+        # TransformBroadcaster (create_publisher etc. work without this
+        # node ever being spun itself; this process's single executor
+        # spins `self`, the outer VisualOdometryNode).
+        self.odometry_publisher = VIOOdometryPublisher()
 
         # Backend work queue. Unbounded and NEVER drops an item: once
         # process_frontend() (see vio_loop_frontend) has called
@@ -172,9 +181,49 @@ class VisualOdometryNode(Node):
                 )
                 continue  # don't report "complete" below for a frame that errored
 
+            self._publish_odometry_if_aligned(frameID, ts)
+
             self.get_logger().info(
                 f"[Frame {frameID}] Backend step complete."
             )
+
+    def _publish_odometry_if_aligned(self, frameID, timestamp):
+        """
+        Publish the latest pose/velocity estimate, gated on
+        self.vio.isVI_aligned -- Phase 1/2 (pre-alignment) poses are
+        vision-only/unscaled and not yet in the metric, gravity-aligned
+        frame odometry consumers expect.
+
+        ViewSet/VIO internals store camera-to-world poses; Odometry is
+        conventionally published in the body/IMU frame, so convert via
+        T_BS (camera->body extrinsic) before publishing, same
+        convention as camera_pose_to_body_pose used elsewhere
+        (imu/vi_alignment.py, vio_core._predict_pose_from_imu).
+        """
+
+        if not self.vio.isVI_aligned:
+            return
+
+        if frameID not in self.vio.view_set.view_ids:
+            # Frame never got a pose committed (e.g. insufficient IMU
+            # coverage entirely -- see visual_inertial_optimization).
+            return
+
+        R_wc, t_wc = self.vio.view_set.get_pose(frameID)
+
+        R_bs = self.vio.T_BS[:3, :3]
+        t_bs = self.vio.T_BS[:3, 3]
+
+        R_wb, t_wb = camera_pose_to_body_pose(R_wc, t_wc, R_bs, t_bs)
+
+        velocity = self.vio.sw_state.velocities.get(frameID)
+
+        self.odometry_publisher.publish_odometry(
+            timestamp,
+            R_wb,
+            t_wb,
+            velocity=velocity,
+        )
 
     def _imu_callback(self, msg: Imu):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -223,6 +272,7 @@ class VisualOdometryNode(Node):
         self._backend_running = False
         self._backend_thread.join(timeout=2.0)
         self.vio.feature_extractor.shutdown()
+        self.odometry_publisher.destroy_node()
         super().destroy_node()
 
 

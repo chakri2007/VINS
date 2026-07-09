@@ -28,6 +28,12 @@ class FactorGraph:
 
         self.landmark_nodes = {}
 
+        # view_id -> (3,) world-frame velocity
+        self.velocity_nodes = {}
+
+        # view_id -> (bias_g (3,), bias_a (3,))
+        self.bias_nodes = {}
+
         #
         # Factors
         #
@@ -61,6 +67,10 @@ class FactorGraph:
 
         print(f"Landmark Nodes  : {len(self.landmark_nodes)}")
 
+        print(f"Velocity Nodes  : {len(self.velocity_nodes)}")
+
+        print(f"Bias Nodes      : {len(self.bias_nodes)}")
+
         print(f"Camera Factors  : {len(self.camera_factors)}")
 
         print(f"IMU Factors     : {len(self.imu_factors)}")
@@ -91,3 +101,28 @@ class FactorGraph:
     def add_imu_factor(self, factor):
 
         self.imu_factors.append(factor)
+
+    def add_velocity(self, view_id, velocity):
+
+        self.velocity_nodes[view_id] = velocity.copy()
+
+    def get_velocity(self, view_id):
+
+        return self.velocity_nodes[view_id].copy()
+
+    def update_velocity(self, view_id, velocity):
+
+        self.velocity_nodes[view_id] = velocity.copy()
+
+    def add_bias(self, view_id, bias_g, bias_a):
+
+        self.bias_nodes[view_id] = (bias_g.copy(), bias_a.copy())
+
+    def get_bias(self, view_id):
+
+        bias_g, bias_a = self.bias_nodes[view_id]
+        return bias_g.copy(), bias_a.copy()
+
+    def update_bias(self, view_id, bias_g, bias_a):
+
+        self.bias_nodes[view_id] = (bias_g.copy(), bias_a.copy())

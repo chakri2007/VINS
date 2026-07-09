@@ -15,8 +15,10 @@ from memory_management.sliding_window import (
     append_imu_measurement,
     extract_imu_between,
     prune_imu_before,
+    get_bias,
 )
 from imu.imu_measurement import IMUMeasurement
+from imu.preintegration_utils import preintegrate_between
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
 
 from vio_core.reprojection import validate_landmarks
@@ -25,6 +27,7 @@ from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence, solve_pnp
 from optimization.graph_builder import GraphBuilder
 from optimization.ceres_bundle_adjustment import CeresBundleAdjuster as BundleAdjuster
 from optimization.ceres_bundle_adjustment_motion import bundle_adjustment_motion
+from optimization.ceres_bundle_adjustment_window import CeresWindowBundleAdjuster
 from optimization.state_update import update_state_from_graph
 from optimization.median_depth import normalize_map
 from imu.vi_alignment import (
@@ -95,6 +98,15 @@ class VisualInertialOdometry():
             # (0.04s) since this only runs once per keyframe, not every
             # frame, and is shielded from the sensor stream.
             'baMaxSolverTimeSeconds': 0.2,
+
+            # Windowed VIO BA (Phase 3) trigger/solver knobs -- see
+            # should_run_window_bundle_adjustment / run_window_bundle_adjustment.
+            # Defaults match MATLAB's helperDecideToRunGraphOptimization
+            # (early-frame floor of 250, then every 3rd frame).
+            'windowOptEarlyFrameFloor':      250,
+            'windowOptimizationFrequency':   3,
+            'windowBaMaxSolverTimeSeconds':  0.04,
+            'windowBaMaxIterations':         8,
         }
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
@@ -753,10 +765,14 @@ class VisualInertialOdometry():
         `view_ids`, sourced from the continuous timestamp-ordered
         sw_state.imu_buffer (see extract_imu_between).
 
-        Uses the sliding window's current bias estimates as the
-        preintegrator's linearization point -- zero before alignment
-        has ever succeeded, matching MATLAB (no bias correction is
-        available yet at this stage either).
+        Uses the sliding window's current per-view bias estimate
+        (falling back to the global bootstrap bias -- see get_bias) as
+        each pair's preintegrator linearization point.
+
+        Delegates the actual preintegration to
+        imu.preintegration_utils.preintegrate_between, the single
+        shared helper also used by _build_single_imu_preintegration and
+        GraphBuilder.build_windowed_vio.
 
         Returns
         -------
@@ -771,31 +787,16 @@ class VisualInertialOdometry():
             t_i = self.view_set.get_timestamp(i)
             t_j = self.view_set.get_timestamp(j)
 
-            samples = extract_imu_between(self.sw_state, t_i, t_j)
+            bias_g, bias_a = get_bias(self.sw_state, i)
 
-            if len(samples) < 2:
+            preint = preintegrate_between(
+                self.sw_state, self.imu_calib, t_i, t_j, bias_g, bias_a,
+            )
+
+            if preint is None:
                 return None
 
-            preintegrator = IMUPreintegrator(
-                gyro_noise=self.imu_calib.get(
-                    'gyroscope_noise_density', 1.0e-3
-                ),
-                accel_noise=self.imu_calib.get(
-                    'accelerometer_noise_density', 1.0e-2
-                ),
-                gyro_random_walk=self.imu_calib.get(
-                    'gyroscope_random_walk', 1.0e-5
-                ),
-                accel_random_walk=self.imu_calib.get(
-                    'accelerometer_random_walk', 1.0e-4
-                ),
-                bias_g=self.sw_state.gyroscope_bias,
-                bias_a=self.sw_state.accelerometer_bias,
-            )
-
-            preintegrations[(i, j)] = preintegrator.integrate_measurements(
-                samples
-            )
+            preintegrations[(i, j)] = preint
 
         return preintegrations
 
@@ -973,37 +974,21 @@ class VisualInertialOdometry():
         already in view_set) and a not-yet-added frame (to_view_id, whose
         timestamp is supplied directly since it hasn't been added yet).
 
-        Uses the sliding window's current bias estimates as the
-        linearization point, same convention as
-        _build_imu_preintegrations. Returns None if IMU coverage is
+        Uses the sliding window's current per-view bias estimate for
+        from_view_id (falling back to the global bootstrap bias -- see
+        get_bias) as the linearization point, same convention as
+        _build_imu_preintegrations. Delegates to the shared
+        preintegrate_between helper. Returns None if IMU coverage is
         insufficient (mirrors that function's behaviour for a single pair).
         """
 
         t_from = self.view_set.get_timestamp(from_view_id)
 
-        samples = extract_imu_between(self.sw_state, t_from, to_timestamp)
+        bias_g, bias_a = get_bias(self.sw_state, from_view_id)
 
-        if len(samples) < 2:
-            return None
-
-        preintegrator = IMUPreintegrator(
-            gyro_noise=self.imu_calib.get(
-                'gyroscope_noise_density', 1.0e-3
-            ),
-            accel_noise=self.imu_calib.get(
-                'accelerometer_noise_density', 1.0e-2
-            ),
-            gyro_random_walk=self.imu_calib.get(
-                'gyroscope_random_walk', 1.0e-5
-            ),
-            accel_random_walk=self.imu_calib.get(
-                'accelerometer_random_walk', 1.0e-4
-            ),
-            bias_g=self.sw_state.gyroscope_bias,
-            bias_a=self.sw_state.accelerometer_bias,
+        return preintegrate_between(
+            self.sw_state, self.imu_calib, t_from, to_timestamp, bias_g, bias_a,
         )
-
-        return preintegrator.integrate_measurements(samples)
 
     def _predict_pose_from_imu(self, prev_view_id, prev_velocity, preint):
         """
@@ -1093,7 +1078,12 @@ class VisualInertialOdometry():
             self.view_set.add_view(frameID, R_pred, t_pred, timestamp)
             self.sw_state.velocities[frameID] = v_pred
             # Bias carries forward unchanged -- no vision/BA update
-            # available this frame to refine it.
+            # available this frame to refine it. Still written
+            # per-view (rather than left absent) so later lookups
+            # (get_bias) find an explicit entry for this view_id
+            # instead of silently falling back further up the chain.
+            prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
+            self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
 
         # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
@@ -1120,7 +1110,7 @@ class VisualInertialOdometry():
         point_ids = [correspondences[i].point_id for i in inlier_idx]
 
         prev_pose = self.view_set.get_pose(prev_view_id)
-        prev_bias = (self.sw_state.gyroscope_bias, self.sw_state.accelerometer_bias)
+        prev_bias = get_bias(self.sw_state, prev_view_id)
 
         # Constant-velocity model for the initial guess -- BA_motion
         # refines it using the IMU factor + reprojection factors.
@@ -1154,14 +1144,93 @@ class VisualInertialOdometry():
         # ---- 4. Write refined state back ------------------------------------
         self.view_set.add_view(frameID, R_refined, C_refined, timestamp)
         self.sw_state.velocities[frameID] = vel_refined
-        self.sw_state.gyroscope_bias = bias_refined[0]
-        self.sw_state.accelerometer_bias = bias_refined[1]
+        # Per-keyframe bias storage (see sliding_window.get_bias): the
+        # global gyroscope_bias/accelerometer_bias fields are left
+        # untouched here -- they remain the bootstrap default that
+        # get_bias() falls back to for views that haven't had a
+        # per-view bias written yet.
+        self.sw_state.biases[frameID] = (bias_refined[0], bias_refined[1])
 
         for k, is_valid in enumerate(valid):
             if is_valid:
                 landmark = self.sw_state.landmarks[point_ids[k]]
                 landmark.add_observation(frameID, uv_pts[k])
 
-        # NOTE: sliding-window FactorGraph build + optimize(fg, ...)
-        # (full window smoothing over multiple keyframes/IMU factors)
-        # intentionally stops here for now -- next phase.
+        # ---- 5. Phase 3 per-frame triangulation -----------------------------
+        # Same triangulation path Phase 2 uses (find_triangulation_candidates
+        # / triangulate_candidates / add_landmarks via run_triangulation()),
+        # now run against the view_set updated with this frame's refined
+        # pose -- mirrors MATLAB's per-frame triangulateNew3DPoints call in
+        # Phase 3, which previously was only wired into Phase 2 (VI_alignment).
+        new_points_triangulated = self.run_triangulation()
+
+        # ---- 6. Windowed VIO bundle adjustment (gated) -----------------------
+        if self.should_run_window_bundle_adjustment(new_points_triangulated):
+            self.run_window_bundle_adjustment()
+
+    def should_run_window_bundle_adjustment(self, new_points_triangulated):
+        """
+        Exact port of MATLAB's helperDecideToRunGraphOptimization: run
+        the windowed VIO BA either during the early-frame warm-up
+        period, on a fixed frame-count cadence thereafter, or whenever
+        this frame added new triangulated landmarks (so the graph
+        stays consistent with fresh structure).
+        """
+        return bool(
+            self.frameID < self.params['windowOptEarlyFrameFloor']
+            or (self.frameID % self.params['windowOptimizationFrequency'] == 0)
+            or new_points_triangulated
+        )
+
+    def run_window_bundle_adjustment(self):
+        """
+        Phase 3 windowed VIO bundle adjustment: build the full
+        poses+velocities+biases+camera+IMU factor graph over the
+        current sliding window (GraphBuilder.build_windowed_vio), fix
+        the oldest window keyframe's pose+velocity+bias for gauge, and
+        optimize with the tight per-frame solver budget
+        (windowBaMaxSolverTimeSeconds / windowBaMaxIterations).
+
+        Refined poses/velocities/biases/landmarks are written back into
+        view_set / sw_state via the extended update_state_from_graph.
+        """
+
+        sw_ids = list(self.sw_state.sliding_window_view_ids)
+
+        if len(sw_ids) == 0:
+            return
+
+        graph = self.graph_builder.build_windowed_vio(
+            view_set=self.view_set,
+            sw_state=self.sw_state,
+            K=self.K,
+            imu_calib=self.imu_calib,
+        )
+
+        window_ba = CeresWindowBundleAdjuster(
+            graph,
+            R_bs=self.T_BS[:3, :3],
+            t_bs=self.T_BS[:3, 3],
+            gravity=self.sw_state.gravity,
+            max_solver_time_in_seconds=self.params['windowBaMaxSolverTimeSeconds'],
+        )
+
+        # Gauge-fix the oldest surviving window keyframe's full
+        # [pose, velocity, bias] node -- matches MATLAB's windowed
+        # graph optimization, which fixes exactly one anchor node per
+        # solve rather than a whole chunk of poses.
+        oldest_view_id = sw_ids[0]
+        if oldest_view_id in graph.pose_nodes:
+            window_ba.fix_node(oldest_view_id)
+
+        result = window_ba.optimize(
+            max_iterations=self.params['windowBaMaxIterations'],
+            verbose=False,
+        )
+
+        if result is not None:
+            update_state_from_graph(
+                graph,
+                self.view_set,
+                self.sw_state,
+            )

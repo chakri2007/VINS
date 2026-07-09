@@ -103,6 +103,20 @@ class SlidingWindowState:
         default_factory=dict
     )
 
+    biases: Dict[int, tuple] = field(default_factory=dict)
+
+
+def get_bias(state: "SlidingWindowState", view_id: int):
+    """
+    Look up the (bias_g, bias_a) estimate for `view_id`, falling back
+    to the global bootstrap bias fields for views that haven't had a
+    per-view bias written yet.
+    """
+    return state.biases.get(
+        view_id,
+        (state.gyroscope_bias, state.accelerometer_bias),
+    )
+
 
 def _within_image(points: np.ndarray, image_shape) -> np.ndarray:
     rows, cols = image_shape[0], image_shape[1]
