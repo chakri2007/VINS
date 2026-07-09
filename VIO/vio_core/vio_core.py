@@ -1063,11 +1063,12 @@ class VisualInertialOdometry():
         preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
 
         if preint is None:
-            # No IMU coverage at all for this interval -- there is
-            # nothing (vision or inertial) to anchor a pose on. This
-            # is the one case where the frame really cannot get a
-            # pose; it stays absent from view_set.
-            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
+            print("[VIO] Insufficient IMU coverage; carrying forward previous pose.")
+            R_prev, t_prev = self.view_set.get_pose(prev_view_id)
+            self.view_set.add_view(frameID, R_prev, t_prev, timestamp)
+            self.sw_state.velocities[frameID] = prev_velocity
+            prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
+            self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
             return
 
         def commit_imu_fallback(reason):
