@@ -23,19 +23,36 @@ from imu.vi_alignment import initialize_visual_inertial_state
 
 def build_preintegration(gyro_block, accel_block, dt, bias_g, bias_a,
                           gyro_noise, accel_noise,
-                          gyro_rw=1.0e-5, accel_rw=1.0e-4):
+                          gyro_rw=1.0e-5, accel_rw=1.0e-4,
+                          real_timestamps=None):
     """
     MATLAB's helperExtractIMUDataBetweenViews returns raw Mx3 gyro/accel
     blocks with no explicit per-sample timestamps -- estimateGravity...
-    assumes a fixed IMU SampleRate. We reconstruct synthetic timestamps
-    at that rate so IMUPreintegrator.integrate_measurements sees the
-    same dt spacing MATLAB's factorIMU used internally.
+    assumes a fixed IMU SampleRate, so for MATLAB-sourced .mat files we
+    reconstruct synthetic timestamps at that rate.
+
+    Python-sourced debug dumps (vio_core.py's try_vi_alignment) now
+    include real per-sample IMU timestamps (`imuTimestamps` in the
+    .mat). When `real_timestamps` is provided, use those instead of the
+    synthetic-rate reconstruction -- intervals with few/irregularly
+    spaced samples otherwise pick up spurious dt error that lands
+    directly in the (already poorly-conditioned) scale estimate.
     """
     n = gyro_block.shape[0]
-    t0 = 0.0
+    if real_timestamps is not None:
+        ts = np.ravel(real_timestamps).astype(np.float64)
+        if len(ts) != n:
+            raise ValueError(
+                f"real_timestamps length ({len(ts)}) doesn't match "
+                f"gyro/accel block length ({n})"
+            )
+    else:
+        t0 = 0.0
+        ts = np.array([t0 + i * dt for i in range(n)], dtype=np.float64)
+
     samples = [
         IMUMeasurement(
-            timestamp=t0 + i * dt,
+            timestamp=float(ts[i]),
             accel=np.asarray(accel_block[i], dtype=np.float64),
             gyro=np.asarray(gyro_block[i], dtype=np.float64),
         )
@@ -60,6 +77,9 @@ def main(mat_path):
     campose_t    = data['campose_t']     # (N,3)
     gyro_cells   = np.atleast_1d(data['gyroData'])
     accel_cells  = np.atleast_1d(data['accelData'])
+    # Only present in Python-sourced dumps (vio_core.py's try_vi_alignment);
+    # absent in MATLAB-sourced ones, so fall back to synthetic timing there.
+    ts_cells     = np.atleast_1d(data['imuTimestamps']) if 'imuTimestamps' in data else None
     T_BS_R       = data['T_BS_R']
     T_BS_t       = data['T_BS_t']
     print("DEBUG - imuGyroNoise raw type/shape:", type(data['imuGyroNoise']), np.shape(data['imuGyroNoise']))
@@ -101,6 +121,7 @@ def main(mat_path):
     for k in range(N - 1):
         gyro_block = np.atleast_2d(gyro_cells[k])
         accel_block = np.atleast_2d(accel_cells[k])
+        real_ts = np.atleast_1d(ts_cells[k]) if ts_cells is not None else None
         preint = build_preintegration(
             gyro_block, accel_block, dt,
             bias_g=np.zeros(3), bias_a=np.zeros(3),
@@ -108,6 +129,7 @@ def main(mat_path):
             accel_noise=imu_accel_noise,
             gyro_rw=imu_gyro_bias_noise,
             accel_rw=imu_accel_bias_noise,
+            real_timestamps=real_ts,
         )
         imu_preintegrations[(sw_ids[k], sw_ids[k + 1])] = preint
 
@@ -123,6 +145,8 @@ def main(mat_path):
     )
 
     print("\n========== Python VI Alignment ==========")
+    print("timing source:", "real per-sample timestamps" if ts_cells is not None
+          else f"synthetic @ {imu_sample_rate:g} Hz (no imuTimestamps in .mat)")
     print("success:   ", result.success)
     print("scale:     ", result.scale,
       "   (MATLAB:", matlab_scale if matlab_scale is not None else "N/A", ")")
