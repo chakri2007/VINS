@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import Image, Imu
 import yaml
 import cv2
@@ -87,6 +88,26 @@ class VisualOdometryNode(Node):
         )
         self._backend_thread.start()
 
+        # ── Callback groups ────────────────────────────────────────────
+        # Two separate MutuallyExclusiveCallbackGroups, not the default
+        # single group. With a MultiThreadedExecutor and no explicit
+        # groups, ALL callbacks share one implicit mutually-exclusive
+        # group -- which is no better than single-threaded spin() for our
+        # purposes and was the original bug. The naive fix of just adding
+        # more executor threads with no groups is actually worse: ROS
+        # would then be free to dispatch image callback N+1 before image
+        # callback N finishes, so multiple vio_loop_frontend() calls can
+        # run concurrently, fighting over state_lock and thrashing the
+        # GIL -- that's the "laggy / not processing properly" regression.
+        # What we actually want is: image callbacks stay serialized
+        # against each other (frontend still processes one frame at a
+        # time, in order), while IMU callbacks are free to run on a
+        # different thread even while an image callback is in flight, so
+        # imu_buffer never stalls behind a slow frontend/backend step.
+        # One group per subscription achieves exactly that.
+        self._image_cb_group = MutuallyExclusiveCallbackGroup()
+        self._imu_cb_group   = MutuallyExclusiveCallbackGroup()
+
         # ── Camera subscriber ─────────────────────────────────────────
         camera_topic = self.ros_config.get('left_camera_topic', '/camera/image_raw')
         if self.mode == 'mono':
@@ -95,6 +116,7 @@ class VisualOdometryNode(Node):
                 camera_topic,
                 self._mono_image_callback,
                 10,
+                callback_group=self._image_cb_group,
             )
             self.get_logger().info(f"Subscribed to camera: {camera_topic}")
 
@@ -105,6 +127,7 @@ class VisualOdometryNode(Node):
             imu_topic,
             self._imu_callback,
             200,
+            callback_group=self._imu_cb_group,
         )
         self.get_logger().info(f"Subscribed to IMU: {imu_topic}")
 
@@ -303,7 +326,12 @@ def main(args=None):
     # process_imu() (now guarded by its own imu_lock, decoupled from
     # backend's state_lock -- see VisualInertialOdometry.__init__) is
     # never starved by frontend/backend work.
-    executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
+    # 2 callback groups (image, IMU) need at most 2 concurrent threads to
+    # both make progress; a couple of spares cover node/timer housekeeping
+    # without over-subscribing threads that would just add scheduling
+    # overhead for no benefit (this is bounding thread count, not doing
+    # the actual serialization -- the callback groups above do that).
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)
     try:
         executor.spin()
