@@ -172,6 +172,28 @@ class VisualInertialOdometry():
         # for the whole backend step.
         self.imu_lock = threading.RLock()
 
+        # Dedicated lock for frontend-only state (self.frameID, self.img_frame,
+        # self.isFirstFrame, self.prev_img_frame, and the per-view
+        # all_observations/all_ids/all_triangulated/is_key_frame/
+        # key_point_track_count fields vio_loop_frontend touches). This is
+        # the actual root cause of "backend appears stuck" -- see
+        # vio_loop_frontend's docstring: frontend is explicitly designed to
+        # "run arbitrarily far ahead of backend without racing it" because
+        # it never touches sliding_window_view_ids/window-membership state,
+        # which only vio_loop_backend mutates. But both methods were wrapped
+        # in the SAME state_lock, so a slow backend Ceres solve (VI-alignment,
+        # windowed BA) blocked the image callback from ever returning --
+        # starving the backend's own work queue of new frames. That reads as
+        # "backend stalled at frame N", but it's actually the frontend
+        # blocked the whole time with nothing new to hand off. Splitting the
+        # lock lets frontend keep tracking/detecting/queueing new frames
+        # while backend is deep in a solve, restoring true frontend/backend
+        # pipelining -- state_lock now guards window-membership/backend
+        # state only.
+        self.frontend_lock = threading.RLock()
+
+        self.image_shape = None
+
         # See commit_imu_fallback() in visual_inertial_optimization(): counts
         # consecutive frames where PnP/BA_motion vision tracking has failed
         # and the pose was committed from IMU prediction alone. Once this
@@ -207,7 +229,7 @@ class VisualInertialOdometry():
         backend's work queue by the caller.
         """
 
-        with self.state_lock:
+        with self.frontend_lock:
             self.frameID += 1
 
             # self.img_frame, self.K = preprocess_image(
@@ -217,6 +239,18 @@ class VisualInertialOdometry():
             #     self.params,
             #
             self.img_frame = raw_img_frame.copy()
+
+            if self.image_shape is None:
+                # Captured once, off the first frame -- backend
+                # (visual_inertial_optimization) needs image_size for
+                # bundle_adjustment_motion but must not read self.img_frame
+                # directly: that field is live-overwritten by this method
+                # on every new frame under frontend_lock, and backend runs
+                # on a different thread under state_lock, so a direct read
+                # would race against frontend writes. Resolution doesn't
+                # change frame to frame, so a one-time snapshot is both
+                # correct and race-free.
+                self.image_shape = self.img_frame.shape
 
             if self.isFirstFrame:
                 self._init_first_frame(
@@ -1246,7 +1280,7 @@ class VisualInertialOdometry():
             xyz_tracked_in_current_view=xyz_pts,
             current_view_correspondences=uv_pts,
             intrinsics_K=self.K,
-            image_size=self.img_frame.shape,
+            image_size=self.image_shape,
             current_view_pose_guess=(R_guess, C_guess),
             current_view_velocity_guess=velocity_guess,
             previous_view_pose=prev_pose,
