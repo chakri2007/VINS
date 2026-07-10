@@ -15,11 +15,18 @@ at all times.  Both are updated together.
 """
 
 import bisect
+import os
 
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 import numpy as np
+
+# Set VIO_DEBUG=1 in the environment to enable the diagnostic prints
+# added throughout this module / vio_core.py while chasing the
+# "Insufficient IMU coverage" issue. Off by default so normal runs
+# aren't spammed.
+VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
 
 from vio_core.ransac import estimate_fundamental_matrix_ransac
 from typing import Dict, Tuple
@@ -425,6 +432,12 @@ def extract_imu_between(
     """
 
     if len(state.imu_buffer) < 2:
+        if VIO_DEBUG:
+            print(
+                f"[IMU-DEBUG] extract_imu_between: buffer has "
+                f"{len(state.imu_buffer)} samples total (<2) -- "
+                f"requested t0={t0:.6f} t1={t1:.6f} (dt={t1 - t0:.6f}s)"
+            )
         return []
 
     timestamps = [m.timestamp for m in state.imu_buffer]
@@ -433,7 +446,27 @@ def extract_imu_between(
     ind2 = _nearest_index(timestamps, t1)
 
     if ind2 <= ind1:
+        if VIO_DEBUG:
+            buf_t0, buf_t1 = timestamps[0], timestamps[-1]
+            t1_str = f"{timestamps[ind2]:.6f}" if ind2 < len(timestamps) else "n/a"
+            print(
+                f"[IMU-DEBUG] extract_imu_between: EMPTY SLICE "
+                f"requested t0={t0:.6f} t1={t1:.6f} (dt={t1 - t0:.6f}s) | "
+                f"ind1={ind1} (t={timestamps[ind1]:.6f}) ind2={ind2} (t={t1_str}) | "
+                f"buffer spans [{buf_t0:.6f}, {buf_t1:.6f}] "
+                f"({len(timestamps)} samples, "
+                f"~{(buf_t1 - buf_t0) / max(1, len(timestamps) - 1) * 1000:.2f}ms/sample) | "
+                f"t0 {'INSIDE' if buf_t0 <= t0 <= buf_t1 else 'OUTSIDE'} buffer range, "
+                f"t1 {'INSIDE' if buf_t0 <= t1 <= buf_t1 else 'OUTSIDE'} buffer range"
+            )
         return []
+
+    if VIO_DEBUG:
+        print(
+            f"[IMU-DEBUG] extract_imu_between: OK t0={t0:.6f} t1={t1:.6f} "
+            f"(dt={t1 - t0:.6f}s) -> {ind2 - ind1} samples "
+            f"[{timestamps[ind1]:.6f}, {timestamps[ind2 - 1]:.6f}]"
+        )
 
     return state.imu_buffer[ind1:ind2]
 
@@ -458,4 +491,13 @@ def prune_imu_before(
 
     idx = bisect.bisect_left(timestamps, keep_from_timestamp)
 
+    before_n = len(state.imu_buffer)
     state.imu_buffer = state.imu_buffer[max(0, idx - 1):]
+
+    if VIO_DEBUG:
+        after_n = len(state.imu_buffer)
+        print(
+            f"[IMU-DEBUG] prune_imu_before: keep_from={keep_from_timestamp:.6f} "
+            f"buffer {before_n} -> {after_n} samples "
+            f"(dropped {before_n - after_n})"
+        )

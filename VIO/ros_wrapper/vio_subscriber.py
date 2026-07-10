@@ -11,6 +11,8 @@ import threading
 import queue
 import traceback
 
+VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
+
 # Make the project root importable regardless of working directory.
 current_dir  = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
@@ -139,6 +141,13 @@ class VisualOdometryNode(Node):
         self._backend_queue.put((frameID, ts))
 
         backlog = self._backend_queue.qsize()
+
+        if VIO_DEBUG:
+            # Unthrottled trend line -- lets you plot backlog vs. frameID
+            # afterwards to see whether the backend is steadily falling
+            # behind (queue growing) vs. just having occasional spikes.
+            print(f"[QUEUE-DEBUG] frame={frameID} backlog={backlog}")
+
         if backlog >= 5:
             # Not fatal, but worth knowing about: the backend is falling
             # behind the camera rate and latency is growing. Throttled so

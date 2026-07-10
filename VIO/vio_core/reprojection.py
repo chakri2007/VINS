@@ -94,3 +94,5 @@ def validate_landmarks(
     #     print(
     #         f"Maximum    : {np.max(all_errors):.3f} px"
     #     )
+
+    return good, bad

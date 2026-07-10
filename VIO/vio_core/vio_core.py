@@ -1,7 +1,13 @@
+import os
 import threading
 
 import cv2
 import numpy as np
+
+# Same flag as memory_management/sliding_window.py -- set VIO_DEBUG=1 to
+# turn on the extra diagnostic prints added while chasing the
+# "Insufficient IMU coverage" / correspondence-collapse issue.
+VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
 
 from vio_core.preprocess_image import preprocess_image
 from vio_core.ransac import estimate_fundamental_matrix_ransac
@@ -105,9 +111,20 @@ class VisualInertialOdometry():
             # (early-frame floor of 250, then every 3rd frame).
             'windowOptEarlyFrameFloor':      250,
             'windowOptimizationFrequency':   3,
-            'windowBaMaxSolverTimeSeconds':  0.04,
+            # Override via env var for quick A/B testing without a code
+            # change, e.g.: VIO_WINDOW_BA_SOLVER_TIME=0.15 python3 ...
+            'windowBaMaxSolverTimeSeconds':  float(
+                os.environ.get('VIO_WINDOW_BA_SOLVER_TIME', 0.04)
+            ),
             'windowBaMaxIterations':         8,
         }
+
+        if VIO_DEBUG:
+            print(
+                f"[VIO-DEBUG] windowBaMaxSolverTimeSeconds = "
+                f"{self.params['windowBaMaxSolverTimeSeconds']:.4f}s "
+                f"(env override {'ACTIVE' if 'VIO_WINDOW_BA_SOLVER_TIME' in os.environ else 'not set'})"
+            )
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
         self.view_set          = ViewSet()
@@ -892,12 +909,19 @@ class VisualInertialOdometry():
             self.sw_state,
         )
 
-        validate_landmarks(
+        good, bad = validate_landmarks(
             self.sw_state,
             self.view_set,
             self.K,
         )
-        # print(f"Triangulation: {num_added} new landmarks added.")
+
+        if VIO_DEBUG:
+            print(
+                f"[TRI-DEBUG] candidates={len(candidates)} "
+                f"triangulated={len(triangulated)} added={num_added} | "
+                f"landmarks: {good} good / {bad} bad "
+                f"({len(self.sw_state.landmarks)} total)"
+            )
 
         return num_added > 0
 
@@ -1060,10 +1084,24 @@ class VisualInertialOdometry():
         # vision-failure branch below now falls back to that IMU-only
         # prediction instead of leaving frameID absent from view_set
         # (see _predict_pose_from_imu docstring for why that matters).
+        prev_ts = self.view_set.get_timestamp(prev_view_id)
+        real_dt = timestamp - prev_ts
+
+        if VIO_DEBUG:
+            print(
+                f"[DT-DEBUG] frame={frameID}: real inter-frame dt="
+                f"{real_dt * 1000:.2f}ms (prev_view={prev_view_id})"
+            )
+
         preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
 
         if preint is None:
-            print("[VIO] Insufficient IMU coverage; extrapolating with constant velocity.")
+            print(
+                f"[VIO] Insufficient IMU coverage; extrapolating with constant velocity. "
+                f"(prev_view={prev_view_id} @ {prev_ts:.6f} -> frame={frameID} @ "
+                f"{timestamp:.6f}, real dt={real_dt * 1000:.2f}ms, "
+                f"imu_buffer size={len(self.sw_state.imu_buffer)})"
+            )
             R_prev, t_prev = self.view_set.get_pose(prev_view_id)
             dt = timestamp - self.view_set.get_timestamp(prev_view_id)
             t_pred = t_prev + prev_velocity * dt   # world-frame constant-velocity guess
@@ -1091,6 +1129,13 @@ class VisualInertialOdometry():
         # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
 
+        if VIO_DEBUG:
+            print(
+                f"[PNP-DEBUG] frame={frameID}: {len(correspondences)} "
+                f"PnP correspondences available, "
+                f"{len(self.sw_state.landmarks)} total landmarks tracked"
+            )
+
         if len(correspondences) < 6:
             commit_imu_fallback("Not enough PnP correspondences")
             return
@@ -1102,6 +1147,14 @@ class VisualInertialOdometry():
             return
 
         R_guess, C_guess, inliers = pnp_result
+
+        if VIO_DEBUG:
+            n_inliers = 0 if inliers is None else len(inliers)
+            ratio = (n_inliers / len(correspondences)) if correspondences else 0.0
+            print(
+                f"[PNP-DEBUG] frame={frameID}: {n_inliers}/{len(correspondences)} "
+                f"inliers ({ratio:.1%})"
+            )
 
         if inliers is None or len(inliers) == 0:
             commit_imu_fallback("PnP found no inliers")
