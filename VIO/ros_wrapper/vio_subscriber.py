@@ -288,11 +288,29 @@ class VisualOdometryNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = VisualOdometryNode()
+    # MultiThreadedExecutor (not the default single-threaded spin()):
+    # image and IMU messages arrive on separate subscriptions but were
+    # both being dispatched by one executor thread. Under the old
+    # single-threaded spin(), a slow image callback (vio_loop_frontend,
+    # itself briefly serialized behind vio_loop_backend's Ceres solves
+    # via the old shared state_lock) could hold the only executor thread
+    # long enough that queued IMU callbacks simply couldn't run --
+    # imu_buffer would silently stop growing for the duration, producing
+    # the "future side" EMPTY SLICE / insufficient-IMU-coverage failures
+    # seen in VIO_DEBUG logs even though IMU was arriving at a clean,
+    # constant rate the whole time. A MultiThreadedExecutor lets the
+    # image and IMU callbacks actually run concurrently, so
+    # process_imu() (now guarded by its own imu_lock, decoupled from
+    # backend's state_lock -- see VisualInertialOdometry.__init__) is
+    # never starved by frontend/backend work.
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down VIO node.")
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

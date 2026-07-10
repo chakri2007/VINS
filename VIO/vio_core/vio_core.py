@@ -153,12 +153,36 @@ class VisualInertialOdometry():
 
         # Guards sw_state / view_set mutations once vio_loop_frontend()
         # (ROS callback thread) and vio_loop_backend() (dedicated worker
-        # thread) can run concurrently -- see vio_subscriber.py. process_imu
-        # (callback thread) and the backend's IMU-buffer reads/prunes
-        # (worker thread) are the most frequent point of overlap, but this
-        # lock is taken generously around any shared-state mutation rather
-        # than reasoned about per-field.
+        # thread) can run concurrently -- see vio_subscriber.py.
         self.state_lock = threading.RLock()
+
+        # Dedicated lock for imu_buffer only. process_imu() must be able to
+        # append IMU samples even while vio_loop_backend() is deep inside a
+        # slow Ceres solve holding state_lock -- otherwise, under ROS 2's
+        # single-threaded executor, a blocked backend callback prevents the
+        # executor from ever dispatching the queued IMU callbacks, and the
+        # buffer silently stops growing for the duration of the solve. That
+        # produces exactly the "future side" EMPTY SLICE failures seen in
+        # VIO_DEBUG logs: the requested preintegration window looks like it
+        # hasn't arrived yet, even though IMU is arriving at a clean,
+        # constant rate the entire time. Keeping this separate from
+        # state_lock means IMU ingestion is never blocked behind
+        # frontend/backend work; readers of imu_buffer (_prune_imu_buffer,
+        # preintegration) take imu_lock only for the brief slice/prune, not
+        # for the whole backend step.
+        self.imu_lock = threading.RLock()
+
+        # See commit_imu_fallback() in visual_inertial_optimization(): counts
+        # consecutive frames where PnP/BA_motion vision tracking has failed
+        # and the pose was committed from IMU prediction alone. Once this
+        # hits VISION_FAILURE_TRIANGULATION_PERIOD, a re-triangulation
+        # attempt is fired off the IMU-predicted pose as a safety net, then
+        # the counter resets -- otherwise a temporary vision dropout can
+        # permanently freeze the landmark pool with no path back (PnP
+        # correspondences only ever shrink as validate_landmarks ages out
+        # unobserved points, so a frozen pool guarantees PnP keeps failing).
+        self.vision_failure_streak = 0
+        self.VISION_FAILURE_TRIANGULATION_PERIOD = 5
 
 
     def vio_loop_frontend(self, raw_img_frame, timestamp):
@@ -426,7 +450,8 @@ class VisualInertialOdometry():
             return
 
         oldest_timestamp = self.view_set.get_timestamp(sw_ids[0])
-        prune_imu_before(self.sw_state, oldest_timestamp)
+        with self.imu_lock:
+            prune_imu_before(self.sw_state, oldest_timestamp)
     
     def get_active_tracks(self, max_history_length: int = 10) -> dict:
         """Build track history for every point still alive in the current frame,
@@ -983,7 +1008,7 @@ class VisualInertialOdometry():
         dropped from the sliding window.
         """
 
-        with self.state_lock:
+        with self.imu_lock:
             append_imu_measurement(
                 self.sw_state,
                 IMUMeasurement(
@@ -1109,6 +1134,22 @@ class VisualInertialOdometry():
             self.sw_state.velocities[frameID] = prev_velocity
             prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
             self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
+
+            # Same safety net as commit_imu_fallback below: this frame also
+            # skipped vision entirely (step 5's run_triangulation() is never
+            # reached this frame), so it counts toward the same streak --
+            # otherwise a run of pure IMU-coverage gaps could starve the
+            # landmark pool exactly like a run of PnP failures does.
+            self.vision_failure_streak += 1
+            if self.vision_failure_streak >= self.VISION_FAILURE_TRIANGULATION_PERIOD:
+                self.vision_failure_streak = 0
+                if VIO_DEBUG:
+                    print(
+                        f"[RECOVERY-DEBUG] frame={frameID}: vision has been "
+                        f"down for {self.VISION_FAILURE_TRIANGULATION_PERIOD} "
+                        f"frames; attempting IMU-pose-guided re-triangulation."
+                    )
+                self.run_triangulation()
             return
 
         def commit_imu_fallback(reason):
@@ -1125,6 +1166,34 @@ class VisualInertialOdometry():
             # instead of silently falling back further up the chain.
             prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
             self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
+
+            # Safety net: PnP failing this frame must not permanently
+            # starve the landmark pool. run_triangulation() is normally
+            # only reached in step 5 below, gated behind a successful
+            # PnP + BA_motion -- so once PnP starts failing, triangulation
+            # stopped being called at all, freezing the landmark count
+            # forever and guaranteeing PnP keeps failing (fewer and fewer
+            # correspondences survive validate_landmarks aging out
+            # unobserved points). frameID now has an IMU-predicted pose
+            # in view_set (add_view above), which is enough of a baseline
+            # for find_triangulation_candidates/triangulate_candidates to
+            # attempt fresh triangulation against -- accuracy is bounded
+            # by prediction quality, but "some new landmarks, off a
+            # slightly-off pose" beats "the pool can mathematically never
+            # grow again". self.vision_failure_streak throttles this to
+            # roughly once every N consecutive failures rather than every
+            # frame, since IMU-only poses drift and triangulating against
+            # every single one is wasted/noisier work.
+            self.vision_failure_streak += 1
+            if self.vision_failure_streak >= self.VISION_FAILURE_TRIANGULATION_PERIOD:
+                self.vision_failure_streak = 0
+                if VIO_DEBUG:
+                    print(
+                        f"[RECOVERY-DEBUG] frame={frameID}: vision has been "
+                        f"down for {self.VISION_FAILURE_TRIANGULATION_PERIOD} "
+                        f"frames; attempting IMU-pose-guided re-triangulation."
+                    )
+                self.run_triangulation()
 
         # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
@@ -1196,6 +1265,11 @@ class VisualInertialOdometry():
             return
 
         R_refined, C_refined = refined_pose
+
+        # Vision succeeded this frame -- clear the failure streak so the
+        # throttled re-triangulation safety net (see commit_imu_fallback)
+        # starts counting fresh from the next failure, if any.
+        self.vision_failure_streak = 0
 
         # ---- 4. Write refined state back ------------------------------------
         self.view_set.add_view(frameID, R_refined, C_refined, timestamp)
