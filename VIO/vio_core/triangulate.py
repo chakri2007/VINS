@@ -64,6 +64,23 @@ def find_triangulation_candidates(
     view1 = sw_ids[-2]
     view2 = sw_ids[-1]
 
+    # update_window_membership's keyframe-promotion test (see
+    # sliding_window.py) is purely vision-based (track/parallax data,
+    # written by the frontend regardless of what the backend does) --
+    # it's entirely decoupled from whether view_set actually has a
+    # committed pose for view1/view2. A frame the backend skipped for
+    # insufficient IMU coverage (visual_inertial_optimization returning
+    # None, never calling view_set.add_view) can still get promoted to
+    # permanent keyframe status here, and then persist in
+    # sliding_window_view_ids for up to window_size more frames before
+    # aging out the oldest end -- silently poisoning every downstream
+    # consumer that assumes "in the window" implies "has a pose"
+    # (this function, GraphBuilder.build/build_windowed_vio). Bail out
+    # rather than handing back candidates that reference a view
+    # get_projection_matrices/get_pose can't resolve.
+    if not (view_set.has_view(view1) and view_set.has_view(view2)):
+        return []
+
     ids1 = sliding_window_state.all_ids[view1]
     ids2 = sliding_window_state.all_ids[view2]
 

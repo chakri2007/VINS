@@ -425,7 +425,26 @@ class VisualInertialOdometry():
         if len(sw_ids) == 0:
             return
 
-        oldest_timestamp = self.view_set.get_timestamp(sw_ids[0])
+        # Same underlying issue as find_triangulation_candidates /
+        # build_windowed_vio (see their comments): a window member can
+        # be a "phantom" keyframe -- promoted by update_window_
+        # membership's purely vision-based parallax test even though
+        # visual_inertial_optimization never committed a pose/timestamp
+        # for it to view_set (insufficient IMU coverage that cycle).
+        # Such a view eventually slides down to sw_ids[0] as the window
+        # advances. Walk forward to the first window member view_set
+        # actually has rather than assuming sw_ids[0] is always it --
+        # skip pruning this cycle if none qualify (nothing stale to
+        # prune yet relative to what we can resolve; try again once the
+        # window has advanced further).
+        oldest_committed = next(
+            (vid for vid in sw_ids if self.view_set.has_view(vid)), None
+        )
+
+        if oldest_committed is None:
+            return
+
+        oldest_timestamp = self.view_set.get_timestamp(oldest_committed)
         prune_imu_before(self.sw_state, oldest_timestamp)
     
     def get_active_tracks(self, max_history_length: int = 10) -> dict:

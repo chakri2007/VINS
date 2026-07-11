@@ -121,6 +121,22 @@ class ViewSet:
     #  Read                                                                #
     # ------------------------------------------------------------------ #
 
+    def has_view(self, view_id: int) -> bool:
+        """
+        O(1) membership check -- whether view_id has a committed pose.
+
+        Window membership (sw_state.sliding_window_view_ids) can
+        legitimately contain view ids that never made it in here (e.g.
+        a frame the backend skipped for insufficient IMU coverage, but
+        which still got promoted to permanent keyframe status by
+        update_window_membership's purely vision-based parallax test --
+        see the comment in triangulate.find_triangulation_candidates).
+        Callers that iterate window membership and then look up poses
+        should check this first rather than relying on try/except
+        KeyError around get_pose.
+        """
+        return view_id in self._views
+
     def get_pose(self, view_id: int) -> Tuple[np.ndarray, np.ndarray]:
         """Return (R, t) for view_id.  R is (3,3), t is (3,).
 

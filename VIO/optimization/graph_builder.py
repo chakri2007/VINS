@@ -169,7 +169,7 @@ class GraphBuilder:
         # rather than being bypassed by build()'s own internal lookup.
         window_ids = [
             vid for vid in sw_state.sliding_window_view_ids
-            if vid in view_set.view_ids
+            if view_set.has_view(vid)
         ]
 
         graph = self.build(view_set, sw_state, K, view_ids=window_ids)
