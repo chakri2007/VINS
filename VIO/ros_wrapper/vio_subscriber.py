@@ -21,7 +21,7 @@ from vio_core.vio_core import VisualInertialOdometry
 from imu.vi_alignment import camera_pose_to_body_pose
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
 from ros_wrapper.vio_publisher import VIOOdometryPublisher
-
+from memory_management.sliding_window import wait_until_imu_ready
 
 class VisualOdometryNode(Node):
     """ROS 2 node: subscribes to a mono camera topic, runs the VIO
@@ -120,7 +120,7 @@ class VisualOdometryNode(Node):
                     f"(prev={self._last_image_timestamp:.6f}, this={timestamp:.6f})"
                 )
         self._last_image_timestamp = timestamp
-        
+
         cv_image  = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
         # Frontend only: KLT tracking + RANSAC + new-feature detection.
@@ -176,6 +176,21 @@ class VisualOdometryNode(Node):
         while self._backend_running:
             try:
                 frameID, ts = self._backend_queue.get(timeout=0.5)
+                #
+                # Wait until the IMU stream has caught up to this frame.
+                # This guarantees that extract_imu_between() will see all
+                # measurements up to the image timestamp.
+                #
+                if not wait_until_imu_ready(
+                    self.vio.sw_state,
+                    ts,
+                ):
+                    self.get_logger().warning(
+                        f"Timed out waiting for IMU coverage for frame "
+                        f"{frameID} ({ts:.6f}). Skipping."
+                    )
+                    continue
+
             except queue.Empty:
                 continue
 

@@ -16,6 +16,8 @@ at all times.  Both are updated together.
 
 import bisect
 
+import threading
+
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -85,6 +87,19 @@ class SlidingWindowState:
     # ------------------------------------------------------------------
 
     imu_buffer: List[IMUMeasurement] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Synchronization primitive used by the backend worker.
+    #
+    # The backend waits on this condition until the IMU buffer contains
+    # measurements covering the timestamp of the frame it wants to
+    # process. Every new IMU sample notifies this condition.
+    # ------------------------------------------------------------------
+    imu_condition: threading.Condition = field(
+        default_factory=threading.Condition,
+        repr=False,
+        compare=False,
+    )
 
     metric_scale: float = 1.0
 
@@ -374,12 +389,15 @@ def append_imu_measurement(
     """
     Append one IMU sample to the continuous buffer.
 
-    Assumes measurements arrive in non-decreasing timestamp order
-    (true for a live sensor stream); extract_imu_between/
-    prune_imu_before rely on the buffer being sorted by timestamp.
+    Every appended measurement notifies any backend thread waiting
+    for additional IMU coverage before processing a frame.
     """
 
-    state.imu_buffer.append(measurement)
+    with state.imu_condition:
+        state.imu_buffer.append(measurement)
+
+        # Wake up any backend thread waiting for more IMU data.
+        state.imu_condition.notify_all()
 
 
 def _nearest_index(timestamps: List[float], t: float) -> int:
@@ -403,6 +421,55 @@ def _nearest_index(timestamps: List[float], t: float) -> int:
     after = timestamps[i]
 
     return (i - 1) if (t - before) <= (after - t) else i
+
+def wait_until_imu_ready(
+    state: SlidingWindowState,
+    target_timestamp: float,
+    timeout: float = 0.5,
+) -> bool:
+    """
+    Block until the IMU buffer contains data at or beyond
+    `target_timestamp`.
+
+    This provides the same synchronization guarantee used by
+    VINS-Mono: backend processing never begins until the IMU
+    stream has caught up to the image timestamp.
+
+    Parameters
+    ----------
+    target_timestamp : float
+        Timestamp of the image/frame to be processed.
+
+    timeout : float
+        Maximum time (seconds) to wait.
+
+    Returns
+    -------
+    bool
+        True if IMU coverage exists.
+        False if timeout occurred.
+    """
+
+    with state.imu_condition:
+
+        #
+        # Wait until:
+        #
+        #   imu_buffer is not empty
+        #
+        # and
+        #
+        #   latest imu timestamp >= target timestamp
+        #
+        ready = state.imu_condition.wait_for(
+            lambda: (
+                len(state.imu_buffer) > 0
+                and state.imu_buffer[-1].timestamp >= target_timestamp
+            ),
+            timeout=timeout,
+        )
+
+    return ready
 
 
 def extract_imu_between(
