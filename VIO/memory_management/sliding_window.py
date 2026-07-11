@@ -472,6 +472,78 @@ def wait_until_imu_ready(
     return ready
 
 
+def get_synced_measurement(
+    state: SlidingWindowState,
+    target_timestamp: float,
+    timeout: float = 0.5,
+) -> Optional[List[IMUMeasurement]]:
+    """
+    Direct port of VINS-Mono's estimator_node.cpp::getMeasurements(),
+    collapsed to the single-image case this backend needs.
+
+    Supersedes the wait_until_imu_ready() + extract_imu_between() pair
+    for the *boundary* call against a frame's own just-captured
+    timestamp: those were two separate lock acquisitions, so nothing
+    prevented _imu_callback() from mutating imu_buffer in the gap
+    between "IMU looks ready" and "now go read it". This function does
+    the readiness check and the extraction under the same held lock,
+    exactly like getMeasurements() does under m_buf -- there is no
+    window where the answer can go stale before it's used.
+
+    It also implements the branch VINS-Mono's getMeasurements() has
+    that wait_until_imu_ready() didn't: if the IMU buffer's *oldest*
+    remaining sample is already newer than target_timestamp (imu_buffer
+    got trimmed past this frame, e.g. the backend fell behind and a
+    prior trim_imu_buffer() call already dropped everything up to a
+    later frame), this frame's IMU coverage can never be satisfied no
+    matter how long we wait. VINS-Mono's answer is to drop that image
+    outright rather than hand it a wrong/partial window; the caller
+    here should treat a None return exactly like a timeout -- skip the
+    frame.
+
+    Parameters
+    ----------
+    target_timestamp : float
+        Timestamp of the image/frame to be processed (this frame's own
+        timestamp, i.e. what used to be `t_to` in extract_imu_between).
+
+    timeout : float
+        Maximum time (seconds) to wait for the IMU stream to catch up.
+
+    Returns
+    -------
+    list[IMUMeasurement], or None if:
+      - timed out waiting for IMU coverage, or
+      - the IMU buffer has already been trimmed past target_timestamp
+        (frame is stale / unsatisfiable -- caller should skip it).
+    """
+
+    with state.imu_condition:
+
+        def ready_or_stale() -> bool:
+            if not state.imu_buffer:
+                return False
+            if state.imu_buffer[0].timestamp > target_timestamp:
+                # stale case -- wake up immediately so the caller can
+                # detect and skip, rather than waiting out the full
+                # timeout for something that will never become ready.
+                return True
+            return state.imu_buffer[-1].timestamp >= target_timestamp
+
+        if not state.imu_condition.wait_for(ready_or_stale, timeout=timeout):
+            return None  # genuine timeout -- IMU stream never caught up
+
+        if not state.imu_buffer or state.imu_buffer[0].timestamp > target_timestamp:
+            return None  # stale -- buffer already moved past this frame
+
+        # Still holding imu_condition's lock here: the extraction below
+        # is atomic with the readiness check above, so no interleaved
+        # _imu_callback() append/trim can invalidate it in between.
+        timestamps = [m.timestamp for m in state.imu_buffer]
+        ind = _nearest_index(timestamps, target_timestamp)
+        return list(state.imu_buffer[: ind + 1])
+
+
 def extract_imu_between(
     state: SlidingWindowState,
     t0: float,
@@ -496,18 +568,26 @@ def extract_imu_between(
     list[IMUMeasurement]
     """
 
-    if len(state.imu_buffer) < 2:
-        return []
+    # Locked for the same reason get_synced_measurement() is: this
+    # reads state.imu_buffer, and _imu_callback()/prune_imu_before()
+    # append to / mutate it concurrently from the ROS executor thread.
+    # Previously this function had no lock at all -- it happened to
+    # mostly work under CPython's GIL, but that's not a guarantee,
+    # and it's not what VINS-Mono's getMeasurements() does (everything
+    # touching imu_buf/feature_buf there is under m_buf).
+    with state.imu_condition:
+        if len(state.imu_buffer) < 2:
+            return []
 
-    timestamps = [m.timestamp for m in state.imu_buffer]
+        timestamps = [m.timestamp for m in state.imu_buffer]
 
-    ind1 = _nearest_index(timestamps, t0)
-    ind2 = _nearest_index(timestamps, t1)
+        ind1 = _nearest_index(timestamps, t0)
+        ind2 = _nearest_index(timestamps, t1)
 
-    if ind2 <= ind1:
-        return []
+        if ind2 <= ind1:
+            return []
 
-    return state.imu_buffer[ind1:ind2]
+        return list(state.imu_buffer[ind1:ind2])
 
 
 def build_preintegration(
@@ -582,11 +662,12 @@ def prune_imu_before(
     before the cutoff as a boundary margin for `extract_imu_between`.
     """
 
-    if not state.imu_buffer:
-        return
+    with state.imu_condition:
+        if not state.imu_buffer:
+            return
 
-    timestamps = [m.timestamp for m in state.imu_buffer]
+        timestamps = [m.timestamp for m in state.imu_buffer]
 
-    idx = bisect.bisect_left(timestamps, keep_from_timestamp)
+        idx = bisect.bisect_left(timestamps, keep_from_timestamp)
 
-    state.imu_buffer = state.imu_buffer[max(0, idx - 1):]
+        state.imu_buffer = state.imu_buffer[max(0, idx - 1):]
