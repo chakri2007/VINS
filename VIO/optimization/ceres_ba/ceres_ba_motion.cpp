@@ -400,8 +400,15 @@ struct ReprojectionErrorFixedPoint {
         T p_cam[3];
         mat3_vec(Rt, diff, p_cam);
 
+        // See ceres_ba/ceres_ba.cpp's ReprojectionError for the full
+        // explanation: bounded zero residual/Jacobian instead of
+        // dividing by a clamped near-zero z.
         T z = p_cam[2];
-        if (z < T(1e-6)) z = T(1e-6);
+        if (z < T(1e-3)) {
+            residuals[0] = T(0.0);
+            residuals[1] = T(0.0);
+            return true;
+        }
 
         T xp = p_cam[0] / z;
         T yp = p_cam[1] / z;

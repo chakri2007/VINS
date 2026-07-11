@@ -71,14 +71,18 @@ struct ReprojectionError {
         T p_cam[3];
         ceres::AngleAxisRotatePoint(neg_rvec, diff, p_cam);
 
-        // behind camera -> Ceres has no branchless "reject", so we clamp
-        // depth away from zero to keep the residual finite/well-defined.
-        // Bad-depth points should be filtered out in Python before
-        // building the problem (same as the scipy path effectively does
-        // via triangulation-time cheirality checks).
+        // Behind (or in the plane of) the camera. Report a bounded zero
+        // residual with zero Jacobian instead of dividing by a clamped
+        // near-zero z (which blew up into a huge, badly-scaled
+        // residual/Jacobian) -- matches camera_factor.py's Python-side
+        // fallback for the same condition. See ceres_ba/ceres_ba.cpp
+        // for the full explanation; Python callers also pre-filter
+        // these via MIN_PROJECTION_DEPTH before building the problem.
         T z = p_cam[2];
-        if (z < T(1e-6)) {
-            z = T(1e-6);
+        if (z < T(1e-3)) {
+            residuals[0] = T(0.0);
+            residuals[1] = T(0.0);
+            return true;
         }
 
         T xp = p_cam[0] / z;

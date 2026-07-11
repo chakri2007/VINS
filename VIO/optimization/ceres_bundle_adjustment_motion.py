@@ -30,6 +30,13 @@ import numpy as np
 
 from optimization.ceres_ba import ceres_ba_motion
 
+# See ceres_bundle_adjustment.py for the full explanation -- ceres_ba_motion
+# .cpp has the identical `if (z < 1e-6) z = 1e-6;` clamp. Here landmarks are
+# fixed and only the pose is solved for, so it's the initial pose guess
+# (not a per-iteration re-check) that determines which correspondences are
+# safe to hand to the solver.
+MIN_PROJECTION_DEPTH = 1e-3
+
 
 class BAMotionResult:
     """Minimal result container, analogous to CeresResult in
@@ -130,10 +137,40 @@ def bundle_adjustment_motion(
     if observation_information is None:
         observation_information = np.eye(2)
 
-    N = len(current_view_correspondences)
+    # Keep the ORIGINAL, full-length arrays untouched: the caller
+    # (vio_core.py's visual_inertial_optimization) indexes the returned
+    # `valid` mask positionally against its own point_ids/uv_pts, which
+    # were built at this same original length -- reassigning these to a
+    # filtered/shorter array would silently misalign `valid` against the
+    # caller's landmark bookkeeping. Instead, build a separate,
+    # solver-only view that drops near/behind-camera correspondences
+    # (see MIN_PROJECTION_DEPTH above), and reconstruct a full-length
+    # `valid` at the end via the existing reprojection check, which
+    # naturally marks any still-bad-depth point invalid anyway.
+    xyz_tracked_in_current_view = np.asarray(xyz_tracked_in_current_view, dtype=np.float64)
+    current_view_correspondences = np.asarray(current_view_correspondences, dtype=np.float64)
 
     R_curr_guess, C_curr_guess = current_view_pose_guess
     R_prev, C_prev = previous_view_pose
+
+    if len(xyz_tracked_in_current_view):
+        pc_guess = (xyz_tracked_in_current_view - C_curr_guess) @ R_curr_guess
+        depth_ok = pc_guess[:, 2] > MIN_PROJECTION_DEPTH
+    else:
+        depth_ok = np.zeros(0, dtype=bool)
+
+    if not np.all(depth_ok):
+        n_dropped = int((~depth_ok).sum())
+        print(
+            f"[BA_motion] Excluding {n_dropped} correspondence(s) with "
+            f"near/behind-camera depth (<= {MIN_PROJECTION_DEPTH} m) at "
+            f"the initial pose guess from the solve."
+        )
+
+    xyz_for_solve = xyz_tracked_in_current_view[depth_ok]
+    uv_for_solve = current_view_correspondences[depth_ok]
+
+    N = len(uv_for_solve)
 
     current_pose_guess_vec = _pose_to_vec(R_curr_guess, C_curr_guess)
     previous_pose_vec = _pose_to_vec(R_prev, C_prev)
@@ -173,13 +210,13 @@ def bundle_adjustment_motion(
     observations = []
     for i in range(N):
         obs = ceres_ba_motion.MotionObservation()
-        obs.u = float(current_view_correspondences[i, 0])
-        obs.v = float(current_view_correspondences[i, 1])
+        obs.u = float(uv_for_solve[i, 0])
+        obs.v = float(uv_for_solve[i, 1])
         obs.L00 = float(L_obs[0, 0])
         obs.L01 = float(L_obs[0, 1])
         obs.L10 = float(L_obs[1, 0])
         obs.L11 = float(L_obs[1, 1])
-        obs.xyz = [float(x) for x in xyz_tracked_in_current_view[i]]
+        obs.xyz = [float(x) for x in xyz_for_solve[i]]
         observations.append(obs)
 
     K = np.asarray(intrinsics_K, dtype=np.float64)

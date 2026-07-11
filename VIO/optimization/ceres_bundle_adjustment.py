@@ -19,6 +19,27 @@ import numpy as np
 
 from optimization.ceres_ba import ceres_ba
 
+# Minimum acceptable depth (meters, along the camera's +Z / viewing axis)
+# for a landmark observation to be handed to the solver.
+#
+# ceres_ba.cpp's ReprojectionError clamps z to >= 1e-6 instead of rejecting
+# the residual outright ("Ceres has no branchless reject"), on the stated
+# assumption that "bad-depth points should be filtered out in Python before
+# building the problem". That filtering previously only happened once, at
+# triangulation time (vio_core/triangulate.py) -- nothing re-checked depth
+# against the CURRENT pose/landmark estimate on every later optimize() call.
+# A landmark that is still nominally "triangulated" can easily end up
+# behind or nearly in the camera plane of some view after a few LM steps
+# (especially with triangulate.py's permissive MIN_TRIANGULATION_ANGLE),
+# and once z is clamped near 1e-6 the 1/z reprojection term explodes into
+# an enormous, badly-scaled residual AND Jacobian -- that's what was
+# driving the multi-order-of-magnitude cost spikes, deeply negative
+# tr_ratio steps, and "CHOLMOD: Matrix not positive definite" failures
+# seen throughout the run. Skipping such observations here, right before
+# packing, is the actual "filter in Python" step the C++ comment assumes
+# exists.
+MIN_PROJECTION_DEPTH = 1e-3
+
 
 class CeresResult:
     """
@@ -112,12 +133,25 @@ class CeresBundleAdjuster:
 
     def _pack_observations(self):
         observations = []
+        skipped_depth = 0
 
         for factor in self.graph.camera_factors:
 
             if factor.view_id not in self.graph.pose_nodes:
                 continue
             if factor.point_id not in self.graph.landmark_nodes:
+                continue
+
+            pose = self.graph.pose_nodes[factor.view_id]
+            R, C = pose["R"], pose["t"]
+            xyz = self.graph.landmark_nodes[factor.point_id]
+
+            # Re-check cheirality against the CURRENT estimate (see
+            # MIN_PROJECTION_DEPTH above) -- not just at triangulation
+            # time.
+            z = float((R.T @ (xyz - C))[2])
+            if z <= MIN_PROJECTION_DEPTH:
+                skipped_depth += 1
                 continue
 
             L = factor.sqrt_information
@@ -133,6 +167,13 @@ class CeresBundleAdjuster:
             obs.L11 = float(L[1, 1])
 
             observations.append(obs)
+
+        if skipped_depth:
+            print(
+                f"[BA] Skipped {skipped_depth} observation(s) with "
+                f"near/behind-camera depth (<= {MIN_PROJECTION_DEPTH} m) "
+                f"before solving."
+            )
 
         return observations
 

@@ -21,7 +21,7 @@ from vio_core.vio_core import VisualInertialOdometry
 from imu.vi_alignment import camera_pose_to_body_pose
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
 from ros_wrapper.vio_publisher import VIOOdometryPublisher
-from memory_management.sliding_window import get_synced_measurement
+from memory_management.sliding_window import wait_until_imu_ready
 
 class VisualOdometryNode(Node):
     """ROS 2 node: subscribes to a mono camera topic, runs the VIO
@@ -177,30 +177,17 @@ class VisualOdometryNode(Node):
             try:
                 frameID, ts = self._backend_queue.get(timeout=0.5)
                 #
-                # Wait until the IMU stream has caught up to this frame,
-                # and extract the measurement atomically with that check
-                # -- direct port of VINS-Mono's getMeasurements(). This
-                # single call replaces the old wait_until_imu_ready() +
-                # extract_imu_between() pair: those were two separate
-                # lock acquisitions, leaving a gap where _imu_callback()
-                # could mutate imu_buffer between "looks ready" and
-                # "read it". It also catches the case wait_until_imu_ready()
-                # didn't: a frame whose IMU coverage was already trimmed
-                # away (backend fell behind) can never become ready, so
-                # this returns None immediately instead of waiting out
-                # the full timeout.
+                # Wait until the IMU stream has caught up to this frame.
+                # This guarantees that extract_imu_between() will see all
+                # measurements up to the image timestamp.
                 #
-                # vio_loop_backend() re-derives its own IMU windows via
-                # extract_imu_between() internally (now itself locked --
-                # see sliding_window.py), so we don't need to thread
-                # `samples` through here; this call's job is purely the
-                # synchronization gate, matching getMeasurements()'s role
-                # of deciding readiness before processIMU/processImage run.
-                if get_synced_measurement(self.vio.sw_state, ts) is None:
+                if not wait_until_imu_ready(
+                    self.vio.sw_state,
+                    ts,
+                ):
                     self.get_logger().warning(
-                        f"No usable IMU coverage for frame {frameID} "
-                        f"({ts:.6f}) -- timed out or stream already moved "
-                        f"past it. Skipping."
+                        f"Timed out waiting for IMU coverage for frame "
+                        f"{frameID} ({ts:.6f}). Skipping."
                     )
                     continue
 

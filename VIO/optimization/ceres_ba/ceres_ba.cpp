@@ -71,14 +71,33 @@ struct ReprojectionError {
         T p_cam[3];
         ceres::AngleAxisRotatePoint(neg_rvec, diff, p_cam);
 
-        // behind camera -> Ceres has no branchless "reject", so we clamp
-        // depth away from zero to keep the residual finite/well-defined.
-        // Bad-depth points should be filtered out in Python before
-        // building the problem (same as the scipy path effectively does
-        // via triangulation-time cheirality checks).
+        // Behind (or in the plane of) the camera. Ceres cost functors
+        // can't branchlessly "reject" a residual block outright, but the
+        // old fix here -- clamping z away from zero and still dividing
+        // by it -- was worse than the disease: xp = p_cam[0]/z blows up
+        // to O(1/1e-6), producing a multi-order-of-magnitude residual
+        // AND (via autodiff) an equally huge, badly-scaled Jacobian for
+        // this single observation. That's what was driving the
+        // repeated cost spikes / negative tr_ratio steps / "CHOLMOD:
+        // Matrix not positive definite" failures seen in testing --
+        // one bad-depth point could dominate and destabilize the whole
+        // Schur complement for that solve.
+        //
+        // Report a bounded zero residual with zero Jacobian instead,
+        // exactly matching camera_factor.py's Python-side fallback for
+        // the same condition (`if uv_pred is None: return np.zeros(2)`)
+        // -- this makes the factor a harmless no-op for this iterate
+        // rather than injecting a spurious huge gradient. The Python
+        // callers additionally pre-filter these before building the
+        // problem at all (see MIN_PROJECTION_DEPTH in
+        // ceres_bundle_adjustment.py) -- this is the defense-in-depth
+        // backstop for any point that drifts behind the camera *during*
+        // the solve itself, between one LM step and the next.
         T z = p_cam[2];
-        if (z < T(1e-6)) {
-            z = T(1e-6);
+        if (z < T(1e-3)) {
+            residuals[0] = T(0.0);
+            residuals[1] = T(0.0);
+            return true;
         }
 
         T xp = p_cam[0] / z;

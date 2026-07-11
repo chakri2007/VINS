@@ -32,6 +32,12 @@ import numpy as np
 
 from optimization.ceres_ba_window import ceres_ba_window
 
+# See ceres_bundle_adjustment.py for the full explanation -- same
+# ceres_ba_window.cpp depth clamp (`if (z < 1e-6) z = 1e-6;`) exists in
+# this solver's cost functor too, so the same pre-solve depth filter is
+# needed here.
+MIN_PROJECTION_DEPTH = 1e-3
+
 
 class CeresWindowResult:
     """Minimal result container, analogous to CeresResult / BAMotionResult."""
@@ -179,12 +185,22 @@ class CeresBundleAdjusterWindow:
 
     def _pack_observations(self):
         observations = []
+        skipped_depth = 0
 
         for factor in self.graph.camera_factors:
 
             if factor.view_id not in self.graph.pose_nodes:
                 continue
             if factor.point_id not in self.graph.landmark_nodes:
+                continue
+
+            pose = self.graph.pose_nodes[factor.view_id]
+            R, C = pose["R"], pose["t"]
+            xyz = self.graph.landmark_nodes[factor.point_id]
+
+            z = float((R.T @ (xyz - C))[2])
+            if z <= MIN_PROJECTION_DEPTH:
+                skipped_depth += 1
                 continue
 
             L = factor.sqrt_information
@@ -200,6 +216,13 @@ class CeresBundleAdjusterWindow:
             obs.L11 = float(L[1, 1])
 
             observations.append(obs)
+
+        if skipped_depth:
+            print(
+                f"[BA_window] Skipped {skipped_depth} observation(s) with "
+                f"near/behind-camera depth (<= {MIN_PROJECTION_DEPTH} m) "
+                f"before solving."
+            )
 
         return observations
 
