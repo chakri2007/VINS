@@ -1234,6 +1234,10 @@ class VisualInertialOdometry():
             reason = "Insufficient IMU coverage" if preint is None else (
                 f"Preintegration interval too short (delta_t={preint.delta_t:.6f}s)"
             )
+            if preint is not None:
+                print(f"[VIO DEBUG] short interval: prev_view_id={prev_view_id} "
+                      f"(t={self.view_set.get_timestamp(prev_view_id):.6f}) "
+                      f"frameID={frameID} (t={timestamp:.6f})")
             print(f"[VIO] {reason}; skipping BA_motion.")
             return None
 
