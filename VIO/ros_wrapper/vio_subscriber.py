@@ -105,11 +105,22 @@ class VisualOdometryNode(Node):
             200,
         )
         self.get_logger().info(f"Subscribed to IMU: {imu_topic}")
+        self._last_image_timestamp = None  # for duplicate/near-duplicate stamp detection
 
     # ── Callbacks ─────────────────────────────────────────────────────
 
     def _mono_image_callback(self, msg: Image):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+        if self._last_image_timestamp is not None:
+            dt = timestamp - self._last_image_timestamp
+            if dt < 0.005:
+                self.get_logger().warn(
+                    f"[VIO] Near-duplicate camera timestamp: dt={dt:.6f}s "
+                    f"(prev={self._last_image_timestamp:.6f}, this={timestamp:.6f})"
+                )
+        self._last_image_timestamp = timestamp
+        
         cv_image  = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
         # Frontend only: KLT tracking + RANSAC + new-feature detection.

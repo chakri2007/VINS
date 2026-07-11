@@ -1221,12 +1221,20 @@ class VisualInertialOdometry():
         # (see _predict_pose_from_imu docstring for why that matters).
         preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
 
-        if preint is None:
+        MIN_PREINTEGRATION_DT = 0.005  # seconds — below this, the interval is
+        # too short to be a real inter-frame gap; treat it the same as no
+        # coverage at all rather than feeding a near-singular covariance
+        # into BA_motion.
+
+        if preint is None or preint.delta_t < MIN_PREINTEGRATION_DT:
             # No IMU coverage at all for this interval -- there is
             # nothing (vision or inertial) to anchor a pose on. This
             # is the one case where the frame really cannot get a
             # pose; it stays absent from view_set.
-            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
+            reason = "Insufficient IMU coverage" if preint is None else (
+                f"Preintegration interval too short (delta_t={preint.delta_t:.6f}s)"
+            )
+            print(f"[VIO] {reason}; skipping BA_motion.")
             return None
 
         def commit_imu_fallback(reason):
