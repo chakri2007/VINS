@@ -477,6 +477,11 @@ def build_preintegration(
     if len(samples) < 2:
         return None
 
+    print(f"[VIO DEBUG] extract_imu_between: t_from={t_from:.6f} t_to={t_to:.6f} "
+          f"requested_span={t_to - t_from:.6f} n_samples={len(samples)} "
+          f"samples_span=[{samples[0].timestamp:.6f},{samples[-1].timestamp:.6f}]="
+          f"{samples[-1].timestamp - samples[0].timestamp:.6f}")
+
     preintegrator = IMUPreintegrator(
         gyro_noise=imu_calib.get(
             'gyroscope_noise_density', 1.0e-3
