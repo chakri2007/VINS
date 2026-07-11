@@ -153,6 +153,12 @@ def bundle_adjustment_motion(
     delta_t = float(p.delta_t)
     bias_lin = _pack_bias(p.bias_g, p.bias_a)
 
+    cov_diag = np.asarray(p.covariance, dtype=np.float64).diagonal()
+    cov_cond = np.linalg.cond(np.asarray(p.covariance, dtype=np.float64))
+    print(f"[BA_motion debug] N={N} delta_t={delta_t:.6f} "
+          f"cov_diag_min={cov_diag.min():.3e} cov_diag_max={cov_diag.max():.3e} "
+          f"cov_cond={cov_cond:.3e}")
+
     J_R_bg = np.asarray(p.J_R_bg, dtype=np.float64).reshape(9)
     J_v_bg = np.asarray(p.J_v_bg, dtype=np.float64).reshape(9)
     J_v_ba = np.asarray(p.J_v_ba, dtype=np.float64).reshape(9)
