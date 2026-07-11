@@ -31,15 +31,28 @@ class GraphBuilder:
         view_set,
         sw_state,
         K,
+        view_ids=None,
     ):
         """
         Build a fresh vision-only factor graph from the current sliding
         window (pose nodes, landmark nodes, camera factors — no IMU).
 
+        view_ids : optional explicit list of window view ids to use
+            instead of sw_state.sliding_window_view_ids as-is. Defaults
+            to sw_state.sliding_window_view_ids (existing behaviour,
+            unchanged for every pre-existing caller). build_windowed_vio
+            passes a pre-filtered list here -- see its docstring -- so
+            this one method stays the single source of pose/landmark/
+            camera-factor construction logic for both the vision-only
+            and windowed graphs, rather than duplicating it.
+
         Returns
         -------
         FactorGraph
         """
+
+        if view_ids is None:
+            view_ids = sw_state.sliding_window_view_ids
 
         graph = FactorGraph(K)
 
@@ -49,7 +62,7 @@ class GraphBuilder:
         # ------------------------------------------------------------------
         #
 
-        for view_id in sw_state.sliding_window_view_ids:
+        for view_id in view_ids:
 
             R, t = view_set.get_pose(view_id)
 
@@ -80,6 +93,8 @@ class GraphBuilder:
         # ------------------------------------------------------------------
         #
 
+        window_id_set = set(view_ids)
+
         for landmark in sw_state.landmarks.values():
 
             for obs in landmark.observations:
@@ -87,8 +102,7 @@ class GraphBuilder:
                 #
                 # Ignore observations outside the window
                 #
-                window_ids = set(sw_state.sliding_window_view_ids)
-                if obs.view_id not in window_ids:
+                if obs.view_id not in window_id_set:
                     continue
 
                 graph.add_camera_factor(
@@ -141,9 +155,24 @@ class GraphBuilder:
         and try again once the IMU stream has caught up).
         """
 
-        graph = self.build(view_set, sw_state, K)
+        # Window membership (sliding_window_view_ids) can transiently
+        # include the frame currently being processed by
+        # visual_inertial_optimization before it's actually committed
+        # to view_set (e.g. insufficient IMU coverage that cycle --
+        # see vio_core.py's vio_loop_backend, which is the primary
+        # guard against calling this method in that state at all).
+        # Filtering here too is a second, cheap line of defense --
+        # build() below now accepts this pre-filtered list explicitly
+        # (view_ids=...) instead of re-deriving it from
+        # sw_state.sliding_window_view_ids itself, so the filtering
+        # actually takes effect for the pose/camera-factor construction
+        # rather than being bypassed by build()'s own internal lookup.
+        window_ids = [
+            vid for vid in sw_state.sliding_window_view_ids
+            if vid in view_set.view_ids
+        ]
 
-        window_ids = list(sw_state.sliding_window_view_ids)
+        graph = self.build(view_set, sw_state, K, view_ids=window_ids)
 
         #
         # ------------------------------------------------------------------

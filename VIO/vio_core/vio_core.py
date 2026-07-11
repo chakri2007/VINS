@@ -254,7 +254,18 @@ class VisualInertialOdometry():
                     timestamp,
                 )
 
-                if self.should_run_windowed_optimization(new_points_triangulated):
+                # None means frameID never got a pose committed to
+                # view_set this cycle (no IMU coverage, or no velocity
+                # estimate yet for the previous view -- see
+                # visual_inertial_optimization's docstring). Running
+                # build_windowed_vio in that case would try to look up
+                # a pose for a view_id that was never added, which is
+                # exactly the crash this guard prevents -- there's also
+                # nothing new to fold into a window optimization pass
+                # regardless.
+                if new_points_triangulated is None:
+                    pass
+                elif self.should_run_windowed_optimization(new_points_triangulated):
                     self.run_windowed_optimization()
 
     def vio_loop(self, raw_img_frame, timestamp):
@@ -1181,7 +1192,7 @@ class VisualInertialOdometry():
             # No velocity estimate yet for the previous view -- can't
             # form the IMU factor's previous-state anchor.
             print("[VIO] No velocity estimate for previous view; skipping BA_motion.")
-            return
+            return None
 
         # ---- 1. IMU preintegration between previous view and this frame --
         # Moved ahead of the vision steps: MATLAB always predicts `pp,pv`
@@ -1197,7 +1208,7 @@ class VisualInertialOdometry():
             # is the one case where the frame really cannot get a
             # pose; it stays absent from view_set.
             print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
-            return
+            return None
 
         def commit_imu_fallback(reason):
             print(f"[VIO] {reason}; falling back to IMU-only prediction.")
@@ -1219,19 +1230,19 @@ class VisualInertialOdometry():
 
         if len(correspondences) < 6:
             commit_imu_fallback("Not enough PnP correspondences")
-            return
+            return False
 
         pnp_result = solve_pnp(correspondences, self.K)
 
         if pnp_result is None:
             commit_imu_fallback("PnP failed")
-            return
+            return False
 
         R_guess, C_guess, inliers = pnp_result
 
         if inliers is None or len(inliers) == 0:
             commit_imu_fallback("PnP found no inliers")
-            return
+            return False
 
         inlier_idx = inliers.flatten()
         xyz_pts = np.array([correspondences[i].xyz for i in inlier_idx])
@@ -1266,7 +1277,7 @@ class VisualInertialOdometry():
 
         if refined_pose is None:
             commit_imu_fallback("BA_motion did not converge")
-            return
+            return False
 
         R_refined, C_refined = refined_pose
 
