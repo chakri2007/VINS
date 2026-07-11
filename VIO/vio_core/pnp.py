@@ -1,10 +1,7 @@
-import os
 from dataclasses import dataclass
 import numpy as np
 
 import cv2
-
-VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
 
 
 @dataclass
@@ -35,7 +32,6 @@ def find_pnp_correspondences(
     """
 
     correspondences = []
-    num_skipped_bad = 0
 
     #
     # Feature IDs currently tracked in this frame
@@ -62,18 +58,6 @@ def find_pnp_correspondences(
 
         landmark = sliding_window_state.landmarks[point_id]
 
-        # NOTE (bug fix): validate_landmarks() (vio_core/reprojection.py)
-        # flags landmark.is_bad based on reprojection error, but until
-        # this check was added, nothing downstream ever read that flag
-        # -- landmarks with high reprojection error kept being fed back
-        # into PnP with their stale/wrong triangulated position. That's
-        # a feedback loop: a slightly-off pose -> flags landmarks bad ->
-        # bad landmarks corrupt the next PnP solve -> worse pose -> more
-        # bad landmarks. Excluding them here is the fix.
-        if getattr(landmark, "is_bad", False):
-            num_skipped_bad += 1
-            continue
-
         correspondences.append(
 
             PnPCorrespondence(
@@ -85,13 +69,6 @@ def find_pnp_correspondences(
                 uv=uv.copy(),
 
             )
-        )
-
-    if VIO_DEBUG and num_skipped_bad > 0:
-        print(
-            f"[PNP-DEBUG] view={current_view_id}: excluded "
-            f"{num_skipped_bad} is_bad landmark(s) from correspondences "
-            f"(kept {len(correspondences)})"
         )
 
     # print(

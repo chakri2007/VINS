@@ -1,13 +1,7 @@
-import os
 import threading
 
 import cv2
 import numpy as np
-
-# Same flag as memory_management/sliding_window.py -- set VIO_DEBUG=1 to
-# turn on the extra diagnostic prints added while chasing the
-# "Insufficient IMU coverage" / correspondence-collapse issue.
-VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
 
 from vio_core.preprocess_image import preprocess_image
 from vio_core.ransac import estimate_fundamental_matrix_ransac
@@ -21,10 +15,9 @@ from memory_management.sliding_window import (
     append_imu_measurement,
     extract_imu_between,
     prune_imu_before,
-    get_bias,
+    build_preintegration,
 )
 from imu.imu_measurement import IMUMeasurement
-from imu.preintegration_utils import preintegrate_between
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
 
 from vio_core.reprojection import validate_landmarks
@@ -33,7 +26,7 @@ from vio_core.pnp import find_pnp_correspondences, PnPCorrespondence, solve_pnp
 from optimization.graph_builder import GraphBuilder
 from optimization.ceres_bundle_adjustment import CeresBundleAdjuster as BundleAdjuster
 from optimization.ceres_bundle_adjustment_motion import bundle_adjustment_motion
-from optimization.ceres_bundle_adjustment_window import CeresWindowBundleAdjuster
+from optimization.ceres_bundle_adjustment_window import CeresBundleAdjusterWindow
 from optimization.state_update import update_state_from_graph
 from optimization.median_depth import normalize_map
 from imu.vi_alignment import (
@@ -41,7 +34,6 @@ from imu.vi_alignment import (
     camera_pose_to_body_pose,
     body_pose_to_camera_pose,
 )
-from imu.preintegration import IMUPreintegrator
 from imu.prediction import predict_state
 
 # MATLAB reference guards acceptance of the linear VI-alignment solve
@@ -105,26 +97,20 @@ class VisualInertialOdometry():
             # frame, and is shielded from the sensor stream.
             'baMaxSolverTimeSeconds': 0.2,
 
-            # Windowed VIO BA (Phase 3) trigger/solver knobs -- see
-            # should_run_window_bundle_adjustment / run_window_bundle_adjustment.
-            # Defaults match MATLAB's helperDecideToRunGraphOptimization
-            # (early-frame floor of 250, then every 3rd frame).
-            'windowOptEarlyFrameFloor':      250,
-            'windowOptimizationFrequency':   3,
-            # Override via env var for quick A/B testing without a code
-            # change, e.g.: VIO_WINDOW_BA_SOLVER_TIME=0.15 python3 ...
-            'windowBaMaxSolverTimeSeconds':  float(
-                os.environ.get('VIO_WINDOW_BA_SOLVER_TIME', 0.04)
-            ),
-            'windowBaMaxIterations':         8,
+            # Phase 3 windowed (full-graph) optimizer trigger -- MATLAB-
+            # style helperDecideToRunGraphOptimization gate (see
+            # should_run_windowed_optimization): run every frame during
+            # an initial warmup so the window settles quickly right
+            # after alignment, then fall back to a fixed frequency for
+            # steady-state real-time performance, with new landmark
+            # triangulations always forcing an extra pass in between
+            # (freshly triangulated points benefit most from being
+            # folded into a joint optimization promptly, before drift
+            # accumulates against them).
+            'graphOptWarmupFrames':          250,
+            'graphOptFrequency':             5,
+            'baWindowMaxSolverTimeSeconds':  0.1,
         }
-
-        if VIO_DEBUG:
-            print(
-                f"[VIO-DEBUG] windowBaMaxSolverTimeSeconds = "
-                f"{self.params['windowBaMaxSolverTimeSeconds']:.4f}s "
-                f"(env override {'ACTIVE' if 'VIO_WINDOW_BA_SOLVER_TIME' in os.environ else 'not set'})"
-            )
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
         self.view_set          = ViewSet()
@@ -153,58 +139,12 @@ class VisualInertialOdometry():
 
         # Guards sw_state / view_set mutations once vio_loop_frontend()
         # (ROS callback thread) and vio_loop_backend() (dedicated worker
-        # thread) can run concurrently -- see vio_subscriber.py.
+        # thread) can run concurrently -- see vio_subscriber.py. process_imu
+        # (callback thread) and the backend's IMU-buffer reads/prunes
+        # (worker thread) are the most frequent point of overlap, but this
+        # lock is taken generously around any shared-state mutation rather
+        # than reasoned about per-field.
         self.state_lock = threading.RLock()
-
-        # Dedicated lock for imu_buffer only. process_imu() must be able to
-        # append IMU samples even while vio_loop_backend() is deep inside a
-        # slow Ceres solve holding state_lock -- otherwise, under ROS 2's
-        # single-threaded executor, a blocked backend callback prevents the
-        # executor from ever dispatching the queued IMU callbacks, and the
-        # buffer silently stops growing for the duration of the solve. That
-        # produces exactly the "future side" EMPTY SLICE failures seen in
-        # VIO_DEBUG logs: the requested preintegration window looks like it
-        # hasn't arrived yet, even though IMU is arriving at a clean,
-        # constant rate the entire time. Keeping this separate from
-        # state_lock means IMU ingestion is never blocked behind
-        # frontend/backend work; readers of imu_buffer (_prune_imu_buffer,
-        # preintegration) take imu_lock only for the brief slice/prune, not
-        # for the whole backend step.
-        self.imu_lock = threading.RLock()
-
-        # Dedicated lock for frontend-only state (self.frameID, self.img_frame,
-        # self.isFirstFrame, self.prev_img_frame, and the per-view
-        # all_observations/all_ids/all_triangulated/is_key_frame/
-        # key_point_track_count fields vio_loop_frontend touches). This is
-        # the actual root cause of "backend appears stuck" -- see
-        # vio_loop_frontend's docstring: frontend is explicitly designed to
-        # "run arbitrarily far ahead of backend without racing it" because
-        # it never touches sliding_window_view_ids/window-membership state,
-        # which only vio_loop_backend mutates. But both methods were wrapped
-        # in the SAME state_lock, so a slow backend Ceres solve (VI-alignment,
-        # windowed BA) blocked the image callback from ever returning --
-        # starving the backend's own work queue of new frames. That reads as
-        # "backend stalled at frame N", but it's actually the frontend
-        # blocked the whole time with nothing new to hand off. Splitting the
-        # lock lets frontend keep tracking/detecting/queueing new frames
-        # while backend is deep in a solve, restoring true frontend/backend
-        # pipelining -- state_lock now guards window-membership/backend
-        # state only.
-        self.frontend_lock = threading.RLock()
-
-        self.image_shape = None
-
-        # See commit_imu_fallback() in visual_inertial_optimization(): counts
-        # consecutive frames where PnP/BA_motion vision tracking has failed
-        # and the pose was committed from IMU prediction alone. Once this
-        # hits VISION_FAILURE_TRIANGULATION_PERIOD, a re-triangulation
-        # attempt is fired off the IMU-predicted pose as a safety net, then
-        # the counter resets -- otherwise a temporary vision dropout can
-        # permanently freeze the landmark pool with no path back (PnP
-        # correspondences only ever shrink as validate_landmarks ages out
-        # unobserved points, so a frozen pool guarantees PnP keeps failing).
-        self.vision_failure_streak = 0
-        self.VISION_FAILURE_TRIANGULATION_PERIOD = 5
 
 
     def vio_loop_frontend(self, raw_img_frame, timestamp):
@@ -229,7 +169,7 @@ class VisualInertialOdometry():
         backend's work queue by the caller.
         """
 
-        with self.frontend_lock:
+        with self.state_lock:
             self.frameID += 1
 
             # self.img_frame, self.K = preprocess_image(
@@ -239,18 +179,6 @@ class VisualInertialOdometry():
             #     self.params,
             #
             self.img_frame = raw_img_frame.copy()
-
-            if self.image_shape is None:
-                # Captured once, off the first frame -- backend
-                # (visual_inertial_optimization) needs image_size for
-                # bundle_adjustment_motion but must not read self.img_frame
-                # directly: that field is live-overwritten by this method
-                # on every new frame under frontend_lock, and backend runs
-                # on a different thread under state_lock, so a direct read
-                # would race against frontend writes. Resolution doesn't
-                # change frame to frame, so a one-time snapshot is both
-                # correct and race-free.
-                self.image_shape = self.img_frame.shape
 
             if self.isFirstFrame:
                 self._init_first_frame(
@@ -320,11 +248,14 @@ class VisualInertialOdometry():
 
             else:
 
-                self.visual_inertial_optimization(
+                new_points_triangulated = self.visual_inertial_optimization(
                     window_state,
                     frameID,
                     timestamp,
                 )
+
+                if self.should_run_windowed_optimization(new_points_triangulated):
+                    self.run_windowed_optimization()
 
     def vio_loop(self, raw_img_frame, timestamp):
         """
@@ -484,8 +415,7 @@ class VisualInertialOdometry():
             return
 
         oldest_timestamp = self.view_set.get_timestamp(sw_ids[0])
-        with self.imu_lock:
-            prune_imu_before(self.sw_state, oldest_timestamp)
+        prune_imu_before(self.sw_state, oldest_timestamp)
     
     def get_active_tracks(self, max_history_length: int = 10) -> dict:
         """Build track history for every point still alive in the current frame,
@@ -835,20 +765,37 @@ class VisualInertialOdometry():
             if prev_id in self.sw_state.velocities:
                 self.sw_state.velocities[newest_id] = self.sw_state.velocities[prev_id].copy()
                 
+    def _get_bias(self, view_id):
+        """
+        Per-view (bias_g, bias_a) linearization point for preintegrating
+        IMU data anchored at `view_id`.
+
+        Falls back to the sliding window's global bootstrap bias
+        (sw_state.gyroscope_bias / accelerometer_bias -- zero /
+        alignment's single accel-bias estimate) when `view_id` doesn't
+        have a per-view entry yet, which is the case for every view up
+        through VI alignment and for the first Phase-3 frame (whose
+        "previous view" is the last aligned view, seeded from the
+        global estimate). Every Phase-3 frame after that has its own
+        entry, written by visual_inertial_optimization below.
+        """
+        return self.sw_state.biases.get(
+            view_id,
+            (self.sw_state.gyroscope_bias, self.sw_state.accelerometer_bias),
+        )
+
     def _build_imu_preintegrations(self, view_ids):
         """
         Preintegrate IMU data between every consecutive pair of
         `view_ids`, sourced from the continuous timestamp-ordered
         sw_state.imu_buffer (see extract_imu_between).
 
-        Uses the sliding window's current per-view bias estimate
-        (falling back to the global bootstrap bias -- see get_bias) as
-        each pair's preintegrator linearization point.
-
-        Delegates the actual preintegration to
-        imu.preintegration_utils.preintegrate_between, the single
-        shared helper also used by _build_single_imu_preintegration and
-        GraphBuilder.build_windowed_vio.
+        Each interval (i, j) is linearized at view i's own bias
+        estimate (see _get_bias) -- not a single shared global value --
+        since per-keyframe bias estimates only make sense if every
+        interval anchors to its own "from" view's bias rather than
+        collapsing back onto one stale global bias for the whole
+        window.
 
         Returns
         -------
@@ -863,9 +810,9 @@ class VisualInertialOdometry():
             t_i = self.view_set.get_timestamp(i)
             t_j = self.view_set.get_timestamp(j)
 
-            bias_g, bias_a = get_bias(self.sw_state, i)
+            bias_g, bias_a = self._get_bias(i)
 
-            preint = preintegrate_between(
+            preint = build_preintegration(
                 self.sw_state, self.imu_calib, t_i, t_j, bias_g, bias_a,
             )
 
@@ -968,19 +915,12 @@ class VisualInertialOdometry():
             self.sw_state,
         )
 
-        good, bad = validate_landmarks(
+        validate_landmarks(
             self.sw_state,
             self.view_set,
             self.K,
         )
-
-        if VIO_DEBUG:
-            print(
-                f"[TRI-DEBUG] candidates={len(candidates)} "
-                f"triangulated={len(triangulated)} added={num_added} | "
-                f"landmarks: {good} good / {bad} bad "
-                f"({len(self.sw_state.landmarks)} total)"
-            )
+        # print(f"Triangulation: {num_added} new landmarks added.")
 
         return num_added > 0
 
@@ -996,6 +936,100 @@ class VisualInertialOdometry():
         (see update_sliding_window), so it's the trigger here too.
         """
         return bool(window_state.get("isEnoughParallax", False))
+
+    def should_run_windowed_optimization(self, new_points_triangulated):
+        """
+        MATLAB-style helperDecideToRunGraphOptimization gate for the
+        Phase 3 full-window smoothing pass (run_windowed_optimization):
+
+            - every frame for the first `graphOptWarmupFrames` frames
+              after Phase 3 starts (lets the window settle quickly
+              right after VI alignment, when pose/velocity/bias
+              estimates are freshest and least reliable)
+            - otherwise every `graphOptFrequency`-th frame (steady-
+              state real-time budget)
+            - PLUS whenever new landmarks were triangulated this frame
+              (new_points_triangulated, from visual_inertial_
+              optimization's return value / run_triangulation) --
+              freshly triangulated points benefit from being folded
+              into a joint optimization promptly.
+
+        Only meaningful once isVI_aligned (self.frameID isn't reset at
+        that point, so this uses it directly as a monotonically
+        increasing frame counter -- "first N frames" in absolute terms
+        rather than N frames since alignment, matching how frameID is
+        used elsewhere in this class).
+        """
+
+        if new_points_triangulated:
+            return True
+
+        if self.frameID <= self.params['graphOptWarmupFrames']:
+            return True
+
+        return (self.frameID % self.params['graphOptFrequency']) == 0
+
+    def run_windowed_optimization(self, max_iterations=10, verbose=False):
+        """
+        Phase 3 full sliding-window smoothing pass: build the windowed
+        factor graph over the current window (GraphBuilder.
+        build_windowed_vio -- poses, velocities, biases, landmarks,
+        camera factors, IMU factors) and jointly refine all of it via
+        CeresBundleAdjusterWindow, then write the result back into
+        view_set / sw_state.
+
+        Gauge-fixing: fix_oldest_pose_only (see CeresBundleAdjusterWindow
+        for the reasoning -- with IMU factors present, scale and
+        roll/pitch are already observable, so fully fixing just the
+        oldest pose in the window is enough to resolve the remaining
+        global position/yaw gauge freedom).
+
+        Returns
+        -------
+        CeresWindowResult, or None if the window graph couldn't be
+        built (missing velocity/IMU coverage for some view -- see
+        build_windowed_vio) or the solver didn't report a usable
+        solution.
+        """
+
+        graph = self.graph_builder.build_windowed_vio(
+            self.view_set,
+            self.sw_state,
+            self.K,
+            self.imu_calib,
+        )
+
+        if graph is None:
+            print("[VIO] Windowed optimization skipped: incomplete window state.")
+            return None
+
+        ba = CeresBundleAdjusterWindow(
+            graph,
+            R_bs=self.T_BS[:3, :3],
+            t_bs=self.T_BS[:3, 3],
+            max_solver_time_in_seconds=self.params['baWindowMaxSolverTimeSeconds'],
+        )
+        ba.fix_oldest_pose_only()
+
+        result = ba.optimize(max_iterations=max_iterations, verbose=verbose)
+
+        if result is None:
+            return None
+
+        for view_id in graph.pose_nodes:
+            R, C = graph.get_pose(view_id)
+            self.view_set.update_pose(view_id, R, C)
+
+        for view_id in graph.velocity_nodes:
+            self.sw_state.velocities[view_id] = graph.get_velocity(view_id)
+
+        for view_id in graph.bias_nodes:
+            self.sw_state.biases[view_id] = graph.get_bias(view_id)
+
+        for point_id in graph.landmark_nodes:
+            self.sw_state.landmarks[point_id].xyz = graph.get_landmark(point_id)
+
+        return result
 
     def fix_bundle_adjustment_poses(self, window_state):
         """
@@ -1042,7 +1076,7 @@ class VisualInertialOdometry():
         dropped from the sliding window.
         """
 
-        with self.imu_lock:
+        with self.state_lock:
             append_imu_measurement(
                 self.sw_state,
                 IMUMeasurement(
@@ -1057,19 +1091,17 @@ class VisualInertialOdometry():
         already in view_set) and a not-yet-added frame (to_view_id, whose
         timestamp is supplied directly since it hasn't been added yet).
 
-        Uses the sliding window's current per-view bias estimate for
-        from_view_id (falling back to the global bootstrap bias -- see
-        get_bias) as the linearization point, same convention as
-        _build_imu_preintegrations. Delegates to the shared
-        preintegrate_between helper. Returns None if IMU coverage is
+        Uses from_view_id's own per-view bias estimate as the
+        linearization point (see _get_bias), same convention as
+        _build_imu_preintegrations. Returns None if IMU coverage is
         insufficient (mirrors that function's behaviour for a single pair).
         """
 
         t_from = self.view_set.get_timestamp(from_view_id)
 
-        bias_g, bias_a = get_bias(self.sw_state, from_view_id)
+        bias_g, bias_a = self._get_bias(from_view_id)
 
-        return preintegrate_between(
+        return build_preintegration(
             self.sw_state, self.imu_calib, t_from, to_timestamp, bias_g, bias_a,
         )
 
@@ -1108,7 +1140,8 @@ class VisualInertialOdometry():
     def visual_inertial_optimization(self, window_state, frameID, timestamp):
         """
         Phase 3 (post VI-alignment) per-frame step, up through
-        helperBundleAdjustmentMotion.m ("BA_motion"):
+        helperBundleAdjustmentMotion.m ("BA_motion") plus per-frame
+        triangulation:
 
             1. PnP pose guess for the new frame (helperEstimateCameraPose)
             2. IMU preintegration between the previous view and this frame
@@ -1116,16 +1149,29 @@ class VisualInertialOdometry():
             3. Motion-only Ceres BA refining this frame's
                [pose, velocity, bias] against the fixed previous state
                (helperBundleAdjustmentMotion)
-            4. Write the refined pose/velocity/bias back and register
-               valid landmark observations on this view.
+            4. Write the refined pose/velocity/bias back (per-view, see
+               sw_state.biases) and register valid landmark observations
+               on this view.
+            5. Triangulate any new landmarks visible from this view now
+               that it's committed to view_set (run_triangulation).
+
+        Returns
+        -------
+        bool or None
+            Whether new landmarks were triangulated this frame (the
+            caller's should_run_windowed_optimization gate needs this
+            as its "newPointsTriangulated" escape hatch), or None if
+            the frame never got a pose committed at all (nothing
+            downstream to gate on).
 
         The sliding-window FactorGraph / optimize(fg, ...) full-window
-        smoothing step is intentionally NOT invoked here yet -- that is
-        the next phase, built on top of this one.
+        smoothing step (build_windowed_vio + CeresBundleAdjusterWindow)
+        is a separate call the caller makes using this return value --
+        see should_run_windowed_optimization.
         """
 
         if self.view_set.num_views == 0:
-            return
+            return None
 
         # Previous view already committed to the view set/graph.
         prev_view_id = self.view_set.view_ids[-1]
@@ -1143,47 +1189,14 @@ class VisualInertialOdometry():
         # vision-failure branch below now falls back to that IMU-only
         # prediction instead of leaving frameID absent from view_set
         # (see _predict_pose_from_imu docstring for why that matters).
-        prev_ts = self.view_set.get_timestamp(prev_view_id)
-        real_dt = timestamp - prev_ts
-
-        if VIO_DEBUG:
-            print(
-                f"[DT-DEBUG] frame={frameID}: real inter-frame dt="
-                f"{real_dt * 1000:.2f}ms (prev_view={prev_view_id})"
-            )
-
         preint = self._build_single_imu_preintegration(prev_view_id, frameID, timestamp)
 
         if preint is None:
-            print(
-                f"[VIO] Insufficient IMU coverage; extrapolating with constant velocity. "
-                f"(prev_view={prev_view_id} @ {prev_ts:.6f} -> frame={frameID} @ "
-                f"{timestamp:.6f}, real dt={real_dt * 1000:.2f}ms, "
-                f"imu_buffer size={len(self.sw_state.imu_buffer)})"
-            )
-            R_prev, t_prev = self.view_set.get_pose(prev_view_id)
-            dt = timestamp - self.view_set.get_timestamp(prev_view_id)
-            t_pred = t_prev + prev_velocity * dt   # world-frame constant-velocity guess
-            self.view_set.add_view(frameID, R_prev, t_pred, timestamp)
-            self.sw_state.velocities[frameID] = prev_velocity
-            prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
-            self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
-
-            # Same safety net as commit_imu_fallback below: this frame also
-            # skipped vision entirely (step 5's run_triangulation() is never
-            # reached this frame), so it counts toward the same streak --
-            # otherwise a run of pure IMU-coverage gaps could starve the
-            # landmark pool exactly like a run of PnP failures does.
-            self.vision_failure_streak += 1
-            if self.vision_failure_streak >= self.VISION_FAILURE_TRIANGULATION_PERIOD:
-                self.vision_failure_streak = 0
-                if VIO_DEBUG:
-                    print(
-                        f"[RECOVERY-DEBUG] frame={frameID}: vision has been "
-                        f"down for {self.VISION_FAILURE_TRIANGULATION_PERIOD} "
-                        f"frames; attempting IMU-pose-guided re-triangulation."
-                    )
-                self.run_triangulation()
+            # No IMU coverage at all for this interval -- there is
+            # nothing (vision or inertial) to anchor a pose on. This
+            # is the one case where the frame really cannot get a
+            # pose; it stays absent from view_set.
+            print("[VIO] Insufficient IMU coverage; skipping BA_motion.")
             return
 
         def commit_imu_fallback(reason):
@@ -1194,50 +1207,15 @@ class VisualInertialOdometry():
             self.view_set.add_view(frameID, R_pred, t_pred, timestamp)
             self.sw_state.velocities[frameID] = v_pred
             # Bias carries forward unchanged -- no vision/BA update
-            # available this frame to refine it. Still written
-            # per-view (rather than left absent) so later lookups
-            # (get_bias) find an explicit entry for this view_id
-            # instead of silently falling back further up the chain.
-            prev_bias_g, prev_bias_a = get_bias(self.sw_state, prev_view_id)
-            self.sw_state.biases[frameID] = (prev_bias_g, prev_bias_a)
-
-            # Safety net: PnP failing this frame must not permanently
-            # starve the landmark pool. run_triangulation() is normally
-            # only reached in step 5 below, gated behind a successful
-            # PnP + BA_motion -- so once PnP starts failing, triangulation
-            # stopped being called at all, freezing the landmark count
-            # forever and guaranteeing PnP keeps failing (fewer and fewer
-            # correspondences survive validate_landmarks aging out
-            # unobserved points). frameID now has an IMU-predicted pose
-            # in view_set (add_view above), which is enough of a baseline
-            # for find_triangulation_candidates/triangulate_candidates to
-            # attempt fresh triangulation against -- accuracy is bounded
-            # by prediction quality, but "some new landmarks, off a
-            # slightly-off pose" beats "the pool can mathematically never
-            # grow again". self.vision_failure_streak throttles this to
-            # roughly once every N consecutive failures rather than every
-            # frame, since IMU-only poses drift and triangulating against
-            # every single one is wasted/noisier work.
-            self.vision_failure_streak += 1
-            if self.vision_failure_streak >= self.VISION_FAILURE_TRIANGULATION_PERIOD:
-                self.vision_failure_streak = 0
-                if VIO_DEBUG:
-                    print(
-                        f"[RECOVERY-DEBUG] frame={frameID}: vision has been "
-                        f"down for {self.VISION_FAILURE_TRIANGULATION_PERIOD} "
-                        f"frames; attempting IMU-pose-guided re-triangulation."
-                    )
-                self.run_triangulation()
+            # available this frame to refine it. Still needs its own
+            # per-view entry though, since a *later* frame's
+            # preintegration may anchor on frameID as its "from" view
+            # (see _get_bias) and must not silently fall back to the
+            # stale global bootstrap bias.
+            self.sw_state.biases[frameID] = self._get_bias(prev_view_id)
 
         # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
-
-        if VIO_DEBUG:
-            print(
-                f"[PNP-DEBUG] frame={frameID}: {len(correspondences)} "
-                f"PnP correspondences available, "
-                f"{len(self.sw_state.landmarks)} total landmarks tracked"
-            )
 
         if len(correspondences) < 6:
             commit_imu_fallback("Not enough PnP correspondences")
@@ -1251,14 +1229,6 @@ class VisualInertialOdometry():
 
         R_guess, C_guess, inliers = pnp_result
 
-        if VIO_DEBUG:
-            n_inliers = 0 if inliers is None else len(inliers)
-            ratio = (n_inliers / len(correspondences)) if correspondences else 0.0
-            print(
-                f"[PNP-DEBUG] frame={frameID}: {n_inliers}/{len(correspondences)} "
-                f"inliers ({ratio:.1%})"
-            )
-
         if inliers is None or len(inliers) == 0:
             commit_imu_fallback("PnP found no inliers")
             return
@@ -1269,7 +1239,7 @@ class VisualInertialOdometry():
         point_ids = [correspondences[i].point_id for i in inlier_idx]
 
         prev_pose = self.view_set.get_pose(prev_view_id)
-        prev_bias = get_bias(self.sw_state, prev_view_id)
+        prev_bias = self._get_bias(prev_view_id)
 
         # Constant-velocity model for the initial guess -- BA_motion
         # refines it using the IMU factor + reprojection factors.
@@ -1280,7 +1250,7 @@ class VisualInertialOdometry():
             xyz_tracked_in_current_view=xyz_pts,
             current_view_correspondences=uv_pts,
             intrinsics_K=self.K,
-            image_size=self.image_shape,
+            image_size=self.img_frame.shape,
             current_view_pose_guess=(R_guess, C_guess),
             current_view_velocity_guess=velocity_guess,
             previous_view_pose=prev_pose,
@@ -1300,101 +1270,27 @@ class VisualInertialOdometry():
 
         R_refined, C_refined = refined_pose
 
-        # Vision succeeded this frame -- clear the failure streak so the
-        # throttled re-triangulation safety net (see commit_imu_fallback)
-        # starts counting fresh from the next failure, if any.
-        self.vision_failure_streak = 0
-
         # ---- 4. Write refined state back ------------------------------------
         self.view_set.add_view(frameID, R_refined, C_refined, timestamp)
         self.sw_state.velocities[frameID] = vel_refined
-        # Per-keyframe bias storage (see sliding_window.get_bias): the
-        # global gyroscope_bias/accelerometer_bias fields are left
-        # untouched here -- they remain the bootstrap default that
-        # get_bias() falls back to for views that haven't had a
-        # per-view bias written yet.
-        self.sw_state.biases[frameID] = (bias_refined[0], bias_refined[1])
+        self.sw_state.biases[frameID] = bias_refined
 
         for k, is_valid in enumerate(valid):
             if is_valid:
                 landmark = self.sw_state.landmarks[point_ids[k]]
                 landmark.add_observation(frameID, uv_pts[k])
 
-        # ---- 5. Phase 3 per-frame triangulation -----------------------------
-        # Same triangulation path Phase 2 uses (find_triangulation_candidates
-        # / triangulate_candidates / add_landmarks via run_triangulation()),
-        # now run against the view_set updated with this frame's refined
-        # pose -- mirrors MATLAB's per-frame triangulateNew3DPoints call in
-        # Phase 3, which previously was only wired into Phase 2 (VI_alignment).
+        # ---- 5. Per-frame triangulation --------------------------------
+        # Same triangulation path Phase 2 uses (find_triangulation_
+        # candidates / triangulate_candidates / add_landmarks, wrapped
+        # by run_triangulation), run here against the now-updated
+        # view_set (frameID was just committed above). The return value
+        # feeds the graph-optimizer trigger's "newPointsTriangulated"
+        # escape hatch (see should_run_windowed_optimization).
         new_points_triangulated = self.run_triangulation()
 
-        # ---- 6. Windowed VIO bundle adjustment (gated) -----------------------
-        if self.should_run_window_bundle_adjustment(new_points_triangulated):
-            self.run_window_bundle_adjustment()
+        return new_points_triangulated
 
-    def should_run_window_bundle_adjustment(self, new_points_triangulated):
-        """
-        Exact port of MATLAB's helperDecideToRunGraphOptimization: run
-        the windowed VIO BA either during the early-frame warm-up
-        period, on a fixed frame-count cadence thereafter, or whenever
-        this frame added new triangulated landmarks (so the graph
-        stays consistent with fresh structure).
-        """
-        return bool(
-            self.frameID < self.params['windowOptEarlyFrameFloor']
-            or (self.frameID % self.params['windowOptimizationFrequency'] == 0)
-            or new_points_triangulated
-        )
-
-    def run_window_bundle_adjustment(self):
-        """
-        Phase 3 windowed VIO bundle adjustment: build the full
-        poses+velocities+biases+camera+IMU factor graph over the
-        current sliding window (GraphBuilder.build_windowed_vio), fix
-        the oldest window keyframe's pose+velocity+bias for gauge, and
-        optimize with the tight per-frame solver budget
-        (windowBaMaxSolverTimeSeconds / windowBaMaxIterations).
-
-        Refined poses/velocities/biases/landmarks are written back into
-        view_set / sw_state via the extended update_state_from_graph.
-        """
-
-        sw_ids = list(self.sw_state.sliding_window_view_ids)
-
-        if len(sw_ids) == 0:
-            return
-
-        graph = self.graph_builder.build_windowed_vio(
-            view_set=self.view_set,
-            sw_state=self.sw_state,
-            K=self.K,
-            imu_calib=self.imu_calib,
-        )
-
-        window_ba = CeresWindowBundleAdjuster(
-            graph,
-            R_bs=self.T_BS[:3, :3],
-            t_bs=self.T_BS[:3, 3],
-            gravity=self.sw_state.gravity,
-            max_solver_time_in_seconds=self.params['windowBaMaxSolverTimeSeconds'],
-        )
-
-        # Gauge-fix the oldest surviving window keyframe's full
-        # [pose, velocity, bias] node -- matches MATLAB's windowed
-        # graph optimization, which fixes exactly one anchor node per
-        # solve rather than a whole chunk of poses.
-        oldest_view_id = sw_ids[0]
-        if oldest_view_id in graph.pose_nodes:
-            window_ba.fix_node(oldest_view_id)
-
-        result = window_ba.optimize(
-            max_iterations=self.params['windowBaMaxIterations'],
-            verbose=False,
-        )
-
-        if result is not None:
-            update_state_from_graph(
-                graph,
-                self.view_set,
-                self.sw_state,
-            )
+        # NOTE: sliding-window FactorGraph build + optimize(fg, ...)
+        # (full window smoothing over multiple keyframes/IMU factors)
+        # intentionally stops here for now -- next phase.

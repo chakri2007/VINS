@@ -64,22 +64,6 @@ def find_triangulation_candidates(
     view1 = sw_ids[-2]
     view2 = sw_ids[-1]
 
-    # Defensive: visual_inertial_optimization()'s "Insufficient IMU
-    # coverage" branch is a deliberate exception to the "every keyframe
-    # gets a pose" invariant -- it leaves frameID in
-    # sliding_window_view_ids (window membership is decided earlier, in
-    # vio_loop_backend) but never calls view_set.add_view() for it.
-    # Without this check, that view can become sw_ids[-1]/sw_ids[-2]
-    # here and crash every subsequent triangulate_candidates() call
-    # with a KeyError from view_set.get_pose() -- a one-frame gap
-    # would otherwise turn into a permanent failure for as long as
-    # that view_id stays in the window. Just skip triangulating this
-    # pair for now; it will be retried automatically once the window
-    # advances (or once the missing view gets a pose some other way).
-    committed_view_ids = set(view_set.view_ids)
-    if view1 not in committed_view_ids or view2 not in committed_view_ids:
-        return []
-
     ids1 = sliding_window_state.all_ids[view1]
     ids2 = sliding_window_state.all_ids[view2]
 

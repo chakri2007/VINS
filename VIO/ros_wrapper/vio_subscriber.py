@@ -1,6 +1,5 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from sensor_msgs.msg import Image, Imu
 import yaml
 import cv2
@@ -12,8 +11,6 @@ import threading
 import queue
 import traceback
 
-VIO_DEBUG = os.environ.get("VIO_DEBUG", "0") == "1"
-
 # Make the project root importable regardless of working directory.
 current_dir  = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
@@ -22,8 +19,6 @@ if project_root not in sys.path:
 
 from vio_core.vio_core import VisualInertialOdometry
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
-from ros_wrapper.vio_publisher import VIOOdometryPublisher
-from imu.vi_alignment import camera_pose_to_body_pose
 
 
 class VisualOdometryNode(Node):
@@ -59,13 +54,6 @@ class VisualOdometryNode(Node):
         # ── Visualizer ────────────────────────────────────────────────
         self.visualizer = VOFeatureVisualizer()
 
-        # ── Odometry publisher (nav_msgs/Odometry + TF) ────────────────
-        # Separate rclpy.Node instance -- only used for its publisher/
-        # TransformBroadcaster (create_publisher etc. work without this
-        # node ever being spun itself; this process's single executor
-        # spins `self`, the outer VisualOdometryNode).
-        self.odometry_publisher = VIOOdometryPublisher()
-
         # Backend work queue. Unbounded and NEVER drops an item: once
         # process_frontend() (see vio_loop_frontend) has called
         # update_sliding_window() and committed a frame into
@@ -88,26 +76,6 @@ class VisualOdometryNode(Node):
         )
         self._backend_thread.start()
 
-        # ── Callback groups ────────────────────────────────────────────
-        # Two separate MutuallyExclusiveCallbackGroups, not the default
-        # single group. With a MultiThreadedExecutor and no explicit
-        # groups, ALL callbacks share one implicit mutually-exclusive
-        # group -- which is no better than single-threaded spin() for our
-        # purposes and was the original bug. The naive fix of just adding
-        # more executor threads with no groups is actually worse: ROS
-        # would then be free to dispatch image callback N+1 before image
-        # callback N finishes, so multiple vio_loop_frontend() calls can
-        # run concurrently, fighting over state_lock and thrashing the
-        # GIL -- that's the "laggy / not processing properly" regression.
-        # What we actually want is: image callbacks stay serialized
-        # against each other (frontend still processes one frame at a
-        # time, in order), while IMU callbacks are free to run on a
-        # different thread even while an image callback is in flight, so
-        # imu_buffer never stalls behind a slow frontend/backend step.
-        # One group per subscription achieves exactly that.
-        self._image_cb_group = MutuallyExclusiveCallbackGroup()
-        self._imu_cb_group   = MutuallyExclusiveCallbackGroup()
-
         # ── Camera subscriber ─────────────────────────────────────────
         camera_topic = self.ros_config.get('left_camera_topic', '/camera/image_raw')
         if self.mode == 'mono':
@@ -116,7 +84,6 @@ class VisualOdometryNode(Node):
                 camera_topic,
                 self._mono_image_callback,
                 10,
-                callback_group=self._image_cb_group,
             )
             self.get_logger().info(f"Subscribed to camera: {camera_topic}")
 
@@ -127,7 +94,6 @@ class VisualOdometryNode(Node):
             imu_topic,
             self._imu_callback,
             200,
-            callback_group=self._imu_cb_group,
         )
         self.get_logger().info(f"Subscribed to IMU: {imu_topic}")
 
@@ -164,13 +130,6 @@ class VisualOdometryNode(Node):
         self._backend_queue.put((frameID, ts))
 
         backlog = self._backend_queue.qsize()
-
-        if VIO_DEBUG:
-            # Unthrottled trend line -- lets you plot backlog vs. frameID
-            # afterwards to see whether the backend is steadily falling
-            # behind (queue growing) vs. just having occasional spikes.
-            print(f"[QUEUE-DEBUG] frame={frameID} backlog={backlog}")
-
         if backlog >= 5:
             # Not fatal, but worth knowing about: the backend is falling
             # behind the camera rate and latency is growing. Throttled so
@@ -213,49 +172,9 @@ class VisualOdometryNode(Node):
                 )
                 continue  # don't report "complete" below for a frame that errored
 
-            self._publish_odometry_if_aligned(frameID, ts)
-
             self.get_logger().info(
                 f"[Frame {frameID}] Backend step complete."
             )
-
-    def _publish_odometry_if_aligned(self, frameID, timestamp):
-        """
-        Publish the latest pose/velocity estimate, gated on
-        self.vio.isVI_aligned -- Phase 1/2 (pre-alignment) poses are
-        vision-only/unscaled and not yet in the metric, gravity-aligned
-        frame odometry consumers expect.
-
-        ViewSet/VIO internals store camera-to-world poses; Odometry is
-        conventionally published in the body/IMU frame, so convert via
-        T_BS (camera->body extrinsic) before publishing, same
-        convention as camera_pose_to_body_pose used elsewhere
-        (imu/vi_alignment.py, vio_core._predict_pose_from_imu).
-        """
-
-        if not self.vio.isVI_aligned:
-            return
-
-        if frameID not in self.vio.view_set.view_ids:
-            # Frame never got a pose committed (e.g. insufficient IMU
-            # coverage entirely -- see visual_inertial_optimization).
-            return
-
-        R_wc, t_wc = self.vio.view_set.get_pose(frameID)
-
-        R_bs = self.vio.T_BS[:3, :3]
-        t_bs = self.vio.T_BS[:3, 3]
-
-        R_wb, t_wb = camera_pose_to_body_pose(R_wc, t_wc, R_bs, t_bs)
-
-        velocity = self.vio.sw_state.velocities.get(frameID)
-
-        self.odometry_publisher.publish_odometry(
-            timestamp,
-            R_wb,
-            t_wb,
-            velocity=velocity,
-        )
 
     def _imu_callback(self, msg: Imu):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -304,41 +223,17 @@ class VisualOdometryNode(Node):
         self._backend_running = False
         self._backend_thread.join(timeout=2.0)
         self.vio.feature_extractor.shutdown()
-        self.odometry_publisher.destroy_node()
         super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = VisualOdometryNode()
-    # MultiThreadedExecutor (not the default single-threaded spin()):
-    # image and IMU messages arrive on separate subscriptions but were
-    # both being dispatched by one executor thread. Under the old
-    # single-threaded spin(), a slow image callback (vio_loop_frontend,
-    # itself briefly serialized behind vio_loop_backend's Ceres solves
-    # via the old shared state_lock) could hold the only executor thread
-    # long enough that queued IMU callbacks simply couldn't run --
-    # imu_buffer would silently stop growing for the duration, producing
-    # the "future side" EMPTY SLICE / insufficient-IMU-coverage failures
-    # seen in VIO_DEBUG logs even though IMU was arriving at a clean,
-    # constant rate the whole time. A MultiThreadedExecutor lets the
-    # image and IMU callbacks actually run concurrently, so
-    # process_imu() (now guarded by its own imu_lock, decoupled from
-    # backend's state_lock -- see VisualInertialOdometry.__init__) is
-    # never starved by frontend/backend work.
-    # 2 callback groups (image, IMU) need at most 2 concurrent threads to
-    # both make progress; a couple of spares cover node/timer housekeeping
-    # without over-subscribing threads that would just add scheduling
-    # overhead for no benefit (this is bounding thread count, not doing
-    # the actual serialization -- the callback groups above do that).
-    executor = rclpy.executors.MultiThreadedExecutor(num_threads=3)
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info("Shutting down VIO node.")
     finally:
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

@@ -7,13 +7,10 @@ class FactorGraph:
     """
     Lightweight factor graph.
 
-    Initially contains only camera factors.
-
-    Later it will also contain
-
-        IMU factors
-        Velocity nodes
-        Bias nodes
+    Vision-only graphs (GraphBuilder.build) only ever populate
+    pose_nodes / landmark_nodes / camera_factors. Phase-3 windowed
+    graphs (GraphBuilder.build_windowed_vio) additionally populate
+    velocity_nodes / bias_nodes / imu_factors.
     """
 
     def __init__(self, K):
@@ -28,7 +25,7 @@ class FactorGraph:
 
         self.landmark_nodes = {}
 
-        # view_id -> (3,) world-frame velocity
+        # view_id -> (3,) ndarray
         self.velocity_nodes = {}
 
         # view_id -> (bias_g (3,), bias_a (3,))
@@ -53,6 +50,16 @@ class FactorGraph:
     def add_landmark(self, point_id, xyz):
 
         self.landmark_nodes[point_id] = xyz.copy()
+
+
+    def add_velocity(self, view_id, velocity):
+
+        self.velocity_nodes[view_id] = velocity.copy()
+
+
+    def add_bias(self, view_id, bias_g, bias_a):
+
+        self.bias_nodes[view_id] = (bias_g.copy(), bias_a.copy())
 
 
     def add_camera_factor(self, factor):
@@ -87,7 +94,20 @@ class FactorGraph:
     def get_landmark(self, point_id):
 
         return self.landmark_nodes[point_id].copy()
-    
+
+
+    def get_velocity(self, view_id):
+
+        return self.velocity_nodes[view_id].copy()
+
+
+    def get_bias(self, view_id):
+
+        bias_g, bias_a = self.bias_nodes[view_id]
+
+        return bias_g.copy(), bias_a.copy()
+
+
     def update_pose(self, view_id, R, t):
 
         self.pose_nodes[view_id]["R"] = R.copy()
@@ -98,31 +118,17 @@ class FactorGraph:
 
         self.landmark_nodes[point_id] = xyz.copy()
 
-    def add_imu_factor(self, factor):
-
-        self.imu_factors.append(factor)
-
-    def add_velocity(self, view_id, velocity):
-
-        self.velocity_nodes[view_id] = velocity.copy()
-
-    def get_velocity(self, view_id):
-
-        return self.velocity_nodes[view_id].copy()
 
     def update_velocity(self, view_id, velocity):
 
         self.velocity_nodes[view_id] = velocity.copy()
 
-    def add_bias(self, view_id, bias_g, bias_a):
-
-        self.bias_nodes[view_id] = (bias_g.copy(), bias_a.copy())
-
-    def get_bias(self, view_id):
-
-        bias_g, bias_a = self.bias_nodes[view_id]
-        return bias_g.copy(), bias_a.copy()
 
     def update_bias(self, view_id, bias_g, bias_a):
 
         self.bias_nodes[view_id] = (bias_g.copy(), bias_a.copy())
+
+
+    def add_imu_factor(self, factor):
+
+        self.imu_factors.append(factor)

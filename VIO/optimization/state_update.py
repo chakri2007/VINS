@@ -37,21 +37,6 @@ def update_state_from_graph(
 
             sliding_window_state.landmarks[point_id].xyz = xyz.copy()
 
-    #
-    # Update velocities (Phase 3 windowed VIO only -- vision-only Phase
-    # 1/2 graphs never populate velocity_nodes, so this is a no-op there)
-    #
-    for view_id, velocity in factor_graph.velocity_nodes.items():
-
-        sliding_window_state.velocities[view_id] = velocity.copy()
-
-    #
-    # Update per-keyframe biases (Phase 3 windowed VIO only)
-    #
-    for view_id, (bias_g, bias_a) in factor_graph.bias_nodes.items():
-
-        sliding_window_state.biases[view_id] = (bias_g.copy(), bias_a.copy())
-
     print(
         "[BA] Runtime state updated from factor graph."
     )

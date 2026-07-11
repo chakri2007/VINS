@@ -1,8 +1,7 @@
 from optimization.factor_graph import FactorGraph
 from optimization.camera_factor import CameraFactor
 from optimization.imu_factor import IMUFactor
-from imu.preintegration_utils import preintegrate_between
-from memory_management.sliding_window import get_bias
+from memory_management.sliding_window import build_preintegration
 import numpy as np
 
 class GraphBuilder:
@@ -10,15 +9,17 @@ class GraphBuilder:
     Builds the vision-only sliding-window factor graph (Phase 1/2:
     SfM init + camera-only BA during VI alignment).
 
-    IMU factors are intentionally NOT added here. In the MATLAB
-    reference, factorIMU is only added to the graph once IMU alignment
-    has actually succeeded (isIMUAligned) — adding it earlier, against
-    a not-yet-metric, not-yet-gravity-aligned vision-only map, doesn't
-    match the reference and previously crashed here (imu_preintegrator
-    was being called as a function; IMUPreintegrator has no __call__).
-    IMU-factor wiring belongs in Phase 3, built on top of the
-    timestamp-indexed IMU buffer in memory_management.sliding_window
-    (extract_imu_between), once isVI_aligned is true.
+    IMU factors are intentionally NOT added by this method. In the
+    MATLAB reference, factorIMU is only added to the graph once IMU
+    alignment has actually succeeded (isIMUAligned) — adding it earlier,
+    against a not-yet-metric, not-yet-gravity-aligned vision-only map,
+    doesn't match the reference and previously crashed here
+    (imu_preintegrator was being called as a function; IMUPreintegrator
+    has no __call__). IMU-factor wiring is Phase 3's build_windowed_vio
+    below, built on top of the timestamp-indexed IMU buffer in
+    memory_management.sliding_window (extract_imu_between /
+    build_preintegration), and is only ever called once isVI_aligned
+    is true.
     """
 
     def __init__(self):
@@ -109,45 +110,35 @@ class GraphBuilder:
         sw_state,
         K,
         imu_calib,
-        imu_information=None,
     ):
         """
-        Build the Phase 3 windowed VIO factor graph: poses + velocities
-        + biases + camera factors + IMU factors over the current
-        sliding window.
+        Build the Phase-3 windowed factor graph: everything build()
+        builds (pose nodes, landmark nodes, camera factors) PLUS a
+        velocity node and a bias node per window view, and one IMU
+        factor per consecutive pair of keyframes in the window.
 
-        Unlike `build()` (vision-only, Phase 1/2), every pose node here
-        also gets a paired velocity node and bias node, and consecutive
-        keyframes in the window are linked by an IMUFactor built from
-        the same preintegration helper used by
-        VisualInertialOdometry._build_imu_preintegrations /
-        _build_single_imu_preintegration (see
-        imu/preintegration_utils.py) -- there is exactly one place that
-        constructs an IMUPreintegrator and slices the timestamp-ordered
-        buffer, this method just calls it once per consecutive pair.
+        This is the sliding-window FactorGraph / optimize(fg, ...)
+        step the vision-only build()'s docstring flagged as deferred
+        to Phase 3 -- IMU factors are only ever added here, once
+        isVI_aligned is true and the caller (visual_inertial_
+        optimization / should_run_windowed_optimization in vio_core.py)
+        has decided this is a frame to run the full window optimizer
+        on.
 
-        Parameters
-        ----------
-        view_set, sw_state, K : as in build()
-        imu_calib : dict
-            IMU noise-density calibration (VisualInertialOdometry.imu_calib),
-            forwarded to preintegrate_between.
-        imu_information : (15,15) ndarray, optional
-            Base information matrix for IMU factors when the
-            preintegration's own covariance can't be used (unused by
-            default -- IMUFactor.sqrt_information is derived from each
-            preintegration's own covariance, see
-            ceres_bundle_adjustment_window.py). Kept as a parameter for
-            symmetry with `information` above / future overrides.
+        Bias linearization for each IMU interval uses the "from" view's
+        own per-view bias estimate (sw_state.biases), falling back to
+        the sliding window's global bootstrap bias for any view that
+        doesn't have one yet -- exactly the same convention as
+        VisualInertialOdometry._get_bias / _build_imu_preintegrations,
+        via the same shared build_preintegration helper (so there is
+        one place, not three, that does this).
 
         Returns
         -------
-        FactorGraph, with pose_nodes/velocity_nodes/bias_nodes/
-        camera_factors/imu_factors populated over the window. A
-        keyframe pair with insufficient IMU coverage simply doesn't get
-        an IMUFactor (mirrors the rest of this codebase's
-        insufficient-coverage handling -- it's a gap, not a hard
-        failure of the whole window).
+        FactorGraph, or None if any consecutive window interval is
+        missing IMU coverage (mirrors _build_imu_preintegrations'
+        behaviour -- the caller should skip this optimization cycle
+        and try again once the IMU stream has caught up).
         """
 
         graph = self.build(view_set, sw_state, K)
@@ -156,7 +147,7 @@ class GraphBuilder:
 
         #
         # ------------------------------------------------------------------
-        # Velocity / bias nodes
+        # Velocity / Bias Nodes
         # ------------------------------------------------------------------
         #
 
@@ -164,48 +155,49 @@ class GraphBuilder:
 
             velocity = sw_state.velocities.get(view_id)
             if velocity is None:
-                # No velocity estimate yet for this view (e.g. it was
-                # never touched by BA_motion, only by vision-only
-                # phases) -- can't attach a velocity/bias node, so it
-                # also can't anchor an IMU factor. Skip; the pose node
-                # from build() above still lets it participate in
-                # camera factors.
-                continue
+                # No velocity estimate for this view yet -- can't form
+                # a complete [pose,vel,bias] node. Same defensive floor
+                # visual_inertial_optimization uses.
+                return None
 
-            bias_g, bias_a = get_bias(sw_state, view_id)
+            bias_g, bias_a = sw_state.biases.get(
+                view_id,
+                (sw_state.gyroscope_bias, sw_state.accelerometer_bias),
+            )
 
             graph.add_velocity(view_id, velocity)
             graph.add_bias(view_id, bias_g, bias_a)
 
         #
         # ------------------------------------------------------------------
-        # IMU factors between consecutive window keyframes
+        # IMU Factors -- one per consecutive keyframe pair in the window
         # ------------------------------------------------------------------
         #
 
-        for from_id, to_id in zip(window_ids[:-1], window_ids[1:]):
+        for i, j in zip(window_ids[:-1], window_ids[1:]):
 
-            if from_id not in graph.velocity_nodes or to_id not in graph.velocity_nodes:
-                continue
+            t_i = view_set.get_timestamp(i)
+            t_j = view_set.get_timestamp(j)
 
-            t_from = view_set.get_timestamp(from_id)
-            t_to = view_set.get_timestamp(to_id)
+            bias_g, bias_a = sw_state.biases.get(
+                i,
+                (sw_state.gyroscope_bias, sw_state.accelerometer_bias),
+            )
 
-            bias_g, bias_a = get_bias(sw_state, from_id)
-
-            preint = preintegrate_between(
-                sw_state, imu_calib, t_from, t_to, bias_g, bias_a,
+            preint = build_preintegration(
+                sw_state, imu_calib, t_i, t_j, bias_g, bias_a,
             )
 
             if preint is None:
-                continue
+                # Missing IMU coverage for this interval -- can't build
+                # a complete window graph this cycle.
+                return None
 
             graph.add_imu_factor(
                 IMUFactor(
-                    from_view=from_id,
-                    to_view=to_id,
+                    from_view=i,
+                    to_view=j,
                     preintegration=preint,
-                    information=np.eye(15),
                 )
             )
 
