@@ -231,8 +231,8 @@ def bundle_adjustment_motion(
     print(f"Termination     : {result['termination']}")
     print("========================================================\n")
 
-    if not result["success"]:
-        print(f"[BA_motion] Ceres did not report a usable solution: {result['message']}")
+    if not result["success"] or result["termination"] not in ("CONVERGENCE", "USER_SUCCESS"):
+        print(f"[BA_motion] Rejecting solve ({result['termination']}): {result['message']}")
         return None, None, None, None
 
     R_refined, C_refined = _vec_to_pose(result["pose"])
