@@ -15,12 +15,34 @@ class VIOOdometryPublisher(Node):
 
     Pose convention
     ---------------
-    ViewSet stores (R, t) as the camera-to-world transform, i.e. `t` is
-    already the camera center in world coordinates and `R` rotates
-    camera axes into world axes. That maps directly onto Odometry's
-    pose.pose (position = t, orientation = quaternion(R)) with no
-    inversion needed.
+    This publishes whatever (R, t) it's given as the world_frame_id ->
+    body_frame_id transform, as-is -- it does NOT know about or apply
+    the camera<->body (T_BS) extrinsic itself. The caller is
+    responsible for passing the BODY pose (R_wb, t_wb), already
+    converted from ViewSet's camera-to-world (R_wc, t_wc) via
+    imu.vi_alignment.camera_pose_to_body_pose(R_wc, t_wc, R_bs, t_bs) --
+    see vio_subscriber.py's call site. Publishing the raw camera pose
+    here under the 'vio_body' child frame would be silently wrong for
+    any consumer expecting IMU/body-frame odometry.
+
+    velocity, if given, is also expected in the WORLD frame (same
+    convention as sw_state.velocities) -- publish_odometry rotates it
+    into the body frame internally using the same R passed for
+    orientation, so it must be the R_wb used for that conversion, not
+    R_wc.
     """
+
+    # Fixed diagonal covariance placeholders (position: m^2, orientation:
+    # rad^2, linear velocity: (m/s)^2). VIO doesn't currently track a
+    # real per-pose uncertainty estimate anywhere upstream (Ceres'
+    # Jacobian isn't retained after solve), so these are NOT derived
+    # from anything -- they exist only so downstream consumers (e.g.
+    # robot_localization) don't misread an all-zero covariance as
+    # "perfectly known", which is arguably worse than a rough guess.
+    # Tune to the actual sensor/pipeline if precise fusion matters.
+    _POSITION_VARIANCE    = 0.05    # m^2
+    _ORIENTATION_VARIANCE = 0.02    # rad^2
+    _VELOCITY_VARIANCE    = 0.10    # (m/s)^2
 
     def __init__(self):
         super().__init__('vio_odometry_publisher')
@@ -48,12 +70,16 @@ class VIOOdometryPublisher(Node):
         Parameters
         ----------
         timestamp : seconds (float), same convention as vio_visualizer.
-        R          : (3,3) camera-to-world rotation.
-        t          : (3,) camera-to-world translation (position).
+        R          : (3,3) BODY-to-world rotation (R_wb) -- already
+                     converted from ViewSet's camera-to-world pose via
+                     camera_pose_to_body_pose; see class docstring.
+        t          : (3,) body-to-world translation (t_wb, body origin
+                     in world coordinates), same conversion as R above.
         velocity   : (3,) world-frame velocity, optional. If None (e.g.
-                     BA_motion was skipped for this frame), the twist
-                     fields are left zeroed rather than publishing a
-                     stale value.
+                     the frame never got a velocity estimate committed),
+                     the twist fields are left zeroed and its covariance
+                     is marked unknown rather than publishing a
+                     confident-looking stale/zero value.
         """
 
         stamp = Time(seconds=timestamp).to_msg()
@@ -74,6 +100,15 @@ class VIOOdometryPublisher(Node):
         odom_msg.pose.pose.orientation.y = qy
         odom_msg.pose.pose.orientation.z = qz
 
+        # Row-major 6x6 (x,y,z,rot_x,rot_y,rot_z), diagonal only --
+        # see class docstring for why this isn't literally zero.
+        pose_cov = [0.0] * 36
+        for i in range(3):
+            pose_cov[i * 6 + i] = self._POSITION_VARIANCE
+        for i in range(3, 6):
+            pose_cov[i * 6 + i] = self._ORIENTATION_VARIANCE
+        odom_msg.pose.covariance = pose_cov
+
         if velocity is not None:
             # World-frame velocity; Odometry.twist is body-frame by
             # convention, so rotate into the body frame.
@@ -81,6 +116,24 @@ class VIOOdometryPublisher(Node):
             odom_msg.twist.twist.linear.x = float(v_body[0])
             odom_msg.twist.twist.linear.y = float(v_body[1])
             odom_msg.twist.twist.linear.z = float(v_body[2])
+
+            twist_cov = [0.0] * 36
+            for i in range(3):
+                twist_cov[i * 6 + i] = self._VELOCITY_VARIANCE
+            # Angular velocity isn't tracked as a per-frame state
+            # anywhere upstream (no gyro-bias-corrected rate is stored
+            # per keyframe), so rows/cols 3:6 are left at the
+            # uninformative default rather than fabricating a number.
+            odom_msg.twist.covariance = twist_cov
+        else:
+            # No velocity for this frame -- mark the twist covariance
+            # as "unknown" (large) rather than implying a confident
+            # zero velocity, since the linear fields above are also
+            # left at their zeroed default in this branch.
+            unknown_cov = [0.0] * 36
+            for i in range(6):
+                unknown_cov[i * 6 + i] = 1e6
+            odom_msg.twist.covariance = unknown_cov
 
         self.odom_pub.publish(odom_msg)
 

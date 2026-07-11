@@ -18,7 +18,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from vio_core.vio_core import VisualInertialOdometry
+from imu.vi_alignment import camera_pose_to_body_pose
 from ros_wrapper.vio_visualizer import VOFeatureVisualizer
+from ros_wrapper.vio_publisher import VIOOdometryPublisher
 
 
 class VisualOdometryNode(Node):
@@ -53,6 +55,13 @@ class VisualOdometryNode(Node):
 
         # ── Visualizer ────────────────────────────────────────────────
         self.visualizer = VOFeatureVisualizer()
+
+        # ── Odometry publisher (/vio/odometry + TF) ─────────────────────
+        # Only ever fed BODY-frame poses (see _publish_odometry_if_ready
+        # below) -- VIOOdometryPublisher itself doesn't know about the
+        # camera<->body extrinsic, it just publishes whatever (R, t)
+        # it's handed.
+        self.odom_publisher = VIOOdometryPublisher()
 
         # Backend work queue. Unbounded and NEVER drops an item: once
         # process_frontend() (see vio_loop_frontend) has called
@@ -172,9 +181,61 @@ class VisualOdometryNode(Node):
                 )
                 continue  # don't report "complete" below for a frame that errored
 
+            self._publish_odometry_if_ready(frameID, ts)
+
             self.get_logger().info(
                 f"[Frame {frameID}] Backend step complete."
             )
+
+    def _publish_odometry_if_ready(self, frameID: int, timestamp: float):
+        """
+        Publish /vio/odometry for frameID, if there's actually a
+        committed, metric pose to publish.
+
+        Two gates, both required:
+
+          - self.vio.isVI_aligned: publishing vision-only (Phase 1/2)
+            poses would be actively wrong here -- they're an arbitrary,
+            un-scaled, non-gravity-aligned reconstruction, not metric
+            odometry any consumer of this topic should be trusted with.
+
+          - self.vio.view_set.has_view(frameID): vio_loop_backend can
+            return successfully without frameID ever getting a pose
+            committed to view_set (e.g. insufficient IMU coverage that
+            cycle -- see visual_inertial_optimization's return-value
+            contract and the KeyError fixes earlier in this project).
+            Checking has_view directly, rather than trusting that a
+            successful backend call implies a pose exists, sidesteps
+            that whole class of bug instead of re-deriving it here.
+
+        Converts ViewSet's camera-to-world pose to the body-to-world
+        pose VIOOdometryPublisher expects (see its docstring) via the
+        same camera_pose_to_body_pose helper vio_core.py itself uses,
+        so this stays in lock-step with the rest of the pipeline's T_BS
+        convention rather than re-implementing it here.
+        """
+
+        if not self.vio.isVI_aligned:
+            return
+
+        if not self.vio.view_set.has_view(frameID):
+            return
+
+        R_wc, C = self.vio.view_set.get_pose(frameID)
+
+        R_bs = self.vio.T_BS[:3, :3]
+        t_bs = self.vio.T_BS[:3, 3]
+
+        R_wb, t_wb = camera_pose_to_body_pose(R_wc, C, R_bs, t_bs)
+
+        velocity = self.vio.sw_state.velocities.get(frameID)
+
+        self.odom_publisher.publish_odometry(
+            timestamp,
+            R_wb,
+            t_wb,
+            velocity,
+        )
 
     def _imu_callback(self, msg: Imu):
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
