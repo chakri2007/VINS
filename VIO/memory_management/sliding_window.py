@@ -341,18 +341,37 @@ def update_window_membership(
         ids_pw = state.all_ids.get(prev_window_view)
         ids_lw = state.all_ids.get(last_window_view)
 
+        avg_parallax = None
+        overlap = None
+
         if ids_pw is not None and ids_lw is not None and len(ids_pw) > 0 and len(ids_lw) > 0:
             _, ia, ib = np.intersect1d(ids_pw[:, 1], ids_lw[:, 1], return_indices=True)
+            overlap = len(ia)
             if len(ia) > 1:
                 m1 = state.all_observations[prev_window_view][ia]
                 m2 = state.all_observations[last_window_view][ib]
-                _, is_kf = quick_check_parallax(m1, m2, key_frame_parallax)
+                avg_parallax, is_kf = quick_check_parallax(m1, m2, key_frame_parallax)
             else:
                 is_kf = False
         else:
             is_kf = False
 
-        last_is_kf = is_kf or state.is_key_frame.get(last_window_view, False)
+        cached_kf = state.is_key_frame.get(last_window_view, False)
+        last_is_kf = is_kf or cached_kf
+
+        # DEBUG: trace why the window front does/doesn't evict. Oldest
+        # slot (sliding_window_view_ids[0]) only ever pops when
+        # last_is_kf is True below -- if this stays False for many
+        # consecutive frames while real motion/triangulation is
+        # happening elsewhere, ids_pw/ids_lw overlap or key_frame_parallax
+        # units are the first things to check.
+        print(
+            f"[WINDOW DEBUG] frame={view_id} oldest={state.sliding_window_view_ids[0]} "
+            f"prev_window_view={prev_window_view} last_window_view={last_window_view} "
+            f"overlap={overlap} avg_parallax={avg_parallax} "
+            f"key_frame_parallax_threshold={key_frame_parallax} "
+            f"is_kf={is_kf} cached_kf={cached_kf} last_is_kf={last_is_kf}"
+        )
 
         if not last_is_kf:
             # replace the last (non-KF) slot — window length unchanged
