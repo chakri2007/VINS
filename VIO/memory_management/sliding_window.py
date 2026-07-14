@@ -590,3 +590,88 @@ def prune_imu_before(
     idx = bisect.bisect_left(timestamps, keep_from_timestamp)
 
     state.imu_buffer = state.imu_buffer[max(0, idx - 1):]
+
+def cull_stale_landmarks(
+    state: SlidingWindowState,
+    window_view_ids,
+    skipped_point_ids,
+    seen_point_ids,
+    max_depth_fail_streak: int = 3,
+):
+    """
+    Remove landmarks from state.landmarks that are no longer of any use
+    to the windowed graph, so they stop being rebuilt / re-skipped every
+    single windowed-BA cycle forever.
+
+    Prior to this, sw_state.landmarks had no removal path at all --
+    GraphBuilder.build() iterates *every* landmark ever triangulated on
+    every call, and ceres_bundle_adjustment_window.py's depth filter
+    would skip the same chronically near/behind-camera points cycle
+    after cycle (470-630 observations skipped per call in production,
+    a number that only ever grew). Two independent categories of
+    landmark are removed here:
+
+    1. Chronic depth failures: `point_id in skipped_point_ids` for
+       `max_depth_fail_streak` consecutive calls. These typically come
+       from a near-zero-parallax triangulation (see
+       vio_core.triangulate.MIN_TRIANGULATION_ANGLE) that was never
+       well-constrained to begin with; there is no evidence continuing
+       to carry them helps, since they never actually get their depth
+       corrected — they only get skipped.
+    2. Orphaned landmarks: every observation of the landmark is older
+       than the current window (`max(obs.view_id) < min(window_view_ids)`).
+       The sliding window only ever moves forward, so such a landmark
+       can never be observed inside a window again and is pure dead
+       weight in every future GraphBuilder.build() call.
+
+    `seen_point_ids` (landmarks that DID get a valid, in-window,
+    positive-depth camera factor this cycle) reset the streak for any
+    point_id that had previously started failing but has since
+    recovered (e.g. once the pose/point estimates improve).
+
+    Call this AFTER writing back the just-solved xyz/pose updates for
+    this cycle (see vio_core.run_windowed_optimization) -- a point_id
+    can be both "seen" this cycle and eligible for removal only on a
+    *future* cycle, never this one.
+
+    Returns
+    -------
+    (n_chronic_removed, n_orphaned_removed)
+    """
+
+    if not window_view_ids:
+        return 0, 0
+
+    window_id_set = set(window_view_ids)
+    oldest_window_view = min(window_id_set)
+
+    n_chronic = 0
+    n_orphaned = 0
+
+    # list(...) -- we mutate state.landmarks while iterating.
+    for point_id, landmark in list(state.landmarks.items()):
+
+        if point_id in seen_point_ids:
+            landmark.depth_fail_streak = 0
+            continue
+
+        if point_id in skipped_point_ids:
+            landmark.depth_fail_streak += 1
+            if landmark.depth_fail_streak >= max_depth_fail_streak:
+                del state.landmarks[point_id]
+                n_chronic += 1
+            continue
+
+        # Neither seen nor skipped this cycle -- wasn't part of this
+        # window's camera factors at all. Only worth a full scan of its
+        # observations (cheap: landmarks typically have few) once it's
+        # a candidate, i.e. its most recent observation already fell
+        # behind the window.
+        if not landmark.observations:
+            continue
+        newest_obs_view = max(obs.view_id for obs in landmark.observations)
+        if newest_obs_view < oldest_window_view:
+            del state.landmarks[point_id]
+            n_orphaned += 1
+
+    return n_chronic, n_orphaned

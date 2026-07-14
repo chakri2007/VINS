@@ -22,22 +22,30 @@ from optimization.ceres_ba import ceres_ba
 # Minimum acceptable depth (meters, along the camera's +Z / viewing axis)
 # for a landmark observation to be handed to the solver.
 #
-# ceres_ba.cpp's ReprojectionError clamps z to >= 1e-6 instead of rejecting
-# the residual outright ("Ceres has no branchless reject"), on the stated
-# assumption that "bad-depth points should be filtered out in Python before
-# building the problem". That filtering previously only happened once, at
-# triangulation time (vio_core/triangulate.py) -- nothing re-checked depth
-# against the CURRENT pose/landmark estimate on every later optimize() call.
-# A landmark that is still nominally "triangulated" can easily end up
-# behind or nearly in the camera plane of some view after a few LM steps
-# (especially with triangulate.py's permissive MIN_TRIANGULATION_ANGLE),
-# and once z is clamped near 1e-6 the 1/z reprojection term explodes into
-# an enormous, badly-scaled residual AND Jacobian -- that's what was
-# driving the multi-order-of-magnitude cost spikes, deeply negative
-# tr_ratio steps, and "CHOLMOD: Matrix not positive definite" failures
-# seen throughout the run. Skipping such observations here, right before
-# packing, is the actual "filter in Python" step the C++ comment assumes
-# exists.
+# NOTE: this comment used to say ceres_ba.cpp's ReprojectionError
+# "clamps z to >= 1e-6 instead of rejecting the residual outright", and
+# that once z is clamped near 1e-6 the 1/z term "explodes into an
+# enormous residual/Jacobian". That described the OLD, since-fixed
+# behavior -- it no longer matches the code and was misleading anyone
+# reading it into thinking the clamp-and-divide bug still exists. The
+# current ceres_ba.cpp (and ceres_ba_window.cpp / ceres_ba_motion.cpp,
+# all three solvers match) instead reports a bounded zero
+# residual/Jacobian for any observation with z < 1e-3, so a point
+# drifting behind the camera *during* the solve (between LM steps) is
+# already a harmless no-op at the C++ level, verified in
+# tests/test_depth_backstop.py.
+#
+# This Python-side MIN_PROJECTION_DEPTH filter is a separate, earlier
+# concern: without it, a landmark that is still nominally "triangulated"
+# but has drifted behind some view since the last solve (previously
+# only checked once, at triangulation time in vio_core/triangulate.py,
+# especially likely given that file's permissive
+# MIN_TRIANGULATION_ANGLE) would still get packed into every future
+# problem as a residual block that's silently zeroed out every single
+# iteration -- wasted Jacobian evaluations forever, and (before the
+# landmark-culling fix in memory_management/sliding_window.py) no path
+# to ever stop happening. Filtering here keeps the packed problem free
+# of such observations from the start.
 MIN_PROJECTION_DEPTH = 1e-3
 
 

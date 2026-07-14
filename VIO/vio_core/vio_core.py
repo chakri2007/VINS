@@ -16,6 +16,7 @@ from memory_management.sliding_window import (
     extract_imu_between,
     prune_imu_before,
     build_preintegration,
+    cull_stale_landmarks,
 )
 from imu.imu_measurement import IMUMeasurement
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
@@ -109,7 +110,15 @@ class VisualInertialOdometry():
             # accumulates against them).
             'graphOptWarmupFrames':          250,
             'graphOptFrequency':             5,
-            'baWindowMaxSolverTimeSeconds':  0.1,
+            # Was 0.1s: synthetic testing shows a realistically-sized
+            # window (~2500 obs, 20 IMU factors) needs ~15-20 LM
+            # iterations to actually satisfy Ceres's convergence
+            # tolerances once real pixel noise + occasional degenerate
+            # IMU factors are present -- 0.1s combined with the old
+            # max_iterations=10 was cutting every single windowed BA
+            # off before it finished, not because the problem was too
+            # big for real-time (per-iteration cost here is sub-10ms).
+            'baWindowMaxSolverTimeSeconds':  0.3,
         }
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
@@ -999,7 +1008,7 @@ class VisualInertialOdometry():
 
         return (self.frameID % self.params['graphOptFrequency']) == 0
 
-    def run_windowed_optimization(self, max_iterations=10, verbose=False):
+    def run_windowed_optimization(self, max_iterations=30, verbose=False):
         """
         Phase 3 full sliding-window smoothing pass: build the windowed
         factor graph over the current window (GraphBuilder.
@@ -1058,6 +1067,24 @@ class VisualInertialOdometry():
 
         for point_id in graph.landmark_nodes:
             self.sw_state.landmarks[point_id].xyz = graph.get_landmark(point_id)
+
+        # Landmark culling -- see memory_management.sliding_window.
+        # cull_stale_landmarks' docstring. Must run after the write-back
+        # above (a point_id updated this cycle must keep that update even
+        # if it's about to be culled for a *different* reason, e.g.
+        # orphaning) and uses the skipped/seen bookkeeping `ba` collected
+        # during _pack_observations for this exact solve.
+        n_chronic, n_orphaned = cull_stale_landmarks(
+            self.sw_state,
+            window_view_ids=list(graph.pose_nodes.keys()),
+            skipped_point_ids=getattr(ba, "last_skipped_point_ids", set()),
+            seen_point_ids=getattr(ba, "last_seen_point_ids", set()),
+        )
+        if n_chronic or n_orphaned:
+            print(
+                f"[VIO] Culled {n_chronic + n_orphaned} stale landmark(s) "
+                f"({n_chronic} chronic depth failures, {n_orphaned} orphaned)."
+            )
 
         return result
 

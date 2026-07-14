@@ -10,6 +10,7 @@ from typing import Optional
 import numpy as np
 
 from imu.preintegration import PreintegratedIMU
+from optimization.ceres_bundle_adjustment_motion import _regularize_information
 
 
 @dataclass
@@ -61,6 +62,16 @@ class IMUFactor:
         if self.information is not None:
             return np.linalg.cholesky(self.information)
 
+        # Bug fix: this used to add a *fixed* eps=1e-9 ridge and invert
+        # directly. Real preintegration covariances for short/degenerate
+        # intervals go as low as ~1e-11 on the diagonal (or are outright
+        # singular), so that fixed ridge silently became the dominant
+        # term, producing information eigenvalues of order 1e9 -- a
+        # single IMU factor able to outweigh every reprojection factor
+        # in the window by many orders of magnitude and wreck the
+        # windowed solver's conditioning (see the matching fix and
+        # longer explanation in ceres_bundle_adjustment_motion.py's
+        # _regularize_information, which this now shares).
         cov = np.asarray(self.preintegration.covariance, dtype=np.float64)
-        cov = 0.5 * (cov + cov.T) + 1e-9 * np.eye(cov.shape[0])
-        return np.linalg.cholesky(np.linalg.inv(cov))
+        information = _regularize_information(cov)
+        return np.linalg.cholesky(information)

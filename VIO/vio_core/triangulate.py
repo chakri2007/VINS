@@ -22,7 +22,18 @@ from typing import List
 import numpy as np
 import cv2
 
-MIN_TRIANGULATION_ANGLE = 1.0      # degrees
+# Was 1.0 deg: near-zero-parallax points have huge, poorly-constrained
+# depth uncertainty at triangulation time. They were being accepted,
+# then failing the near/behind-camera depth check in essentially every
+# subsequent BA_window call (470-630 observations skipped per call in
+# production logs) instead of ever being resolved -- because they were
+# never actually well-conditioned to begin with. Raised to reduce how
+# many chronically-bad landmarks get created in the first place; this
+# should be paired with active landmark culling (see
+# memory_management/sliding_window.py) for points that persistently
+# fail the depth check after this change, since raising the angle
+# threshold alone does not remove already-bad existing landmarks.
+MIN_TRIANGULATION_ANGLE = 2.5      # degrees
 
 @dataclass
 class TriangulationCandidate:

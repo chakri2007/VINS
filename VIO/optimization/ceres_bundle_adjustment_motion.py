@@ -72,19 +72,110 @@ def _pack_bias(bias_g, bias_a):
     ])
 
 
+MAX_IMU_INFO_EIGENVALUE = 1.0e11
+
+
+def _regularize_information(cov, rel_eps=1e-6, abs_eig_floor=1e-12,
+                             max_eigval=MAX_IMU_INFO_EIGENVALUE):
+    """
+    Bug fix (see optimization/imu_factor.py for the shared explanation):
+    a *fixed* eps=1e-9 ridge silently overrode the physical noise model
+    whenever the covariance's own scale dropped below 1e-9, which is
+    common for the position/velocity blocks of short/degenerate
+    intervals -- but note the naive fix of an eigenvalue CEILING alone
+    is wrong too (see below).
+
+    IMPORTANT (found via tests/test_info_cap_headroom.py, using the
+    real IMUPreintegrator + real config/imu.yaml noise densities):
+    legitimately healthy intervals across the ENTIRE realistic range
+    (0.08s-8.5s keyframe spacing) naturally produce covariance
+    eigenvalues as low as ~1e-10 to 1e-8 in the well-constrained
+    rotation direction -- averaging many gyro samples genuinely does
+    make rotation that well known. That means information eigenvalues
+    of 1e8-1e10 are CORRECT, physically-justified precision, not a
+    sign of degeneracy. An earlier version of this fix used a flat
+    eigenvalue cap of 1e6, which silently clipped essentially every
+    real IMU factor -- healthy or not -- discarding 2-4 orders of
+    magnitude of legitimate precision uniformly. That was a real
+    regression (verified capped=True on every realistic interval in
+    test_info_cap_headroom.py) even though it "fixed" the windowed-BA
+    convergence symptom by coincidence (any sufficiently low flat cap
+    would flatten out the specific bad factor along with everything
+    else).
+
+    The actual pathology (verified directly: e.g. a 2-sample, 0.02s
+    interval) is a covariance with a NEGATIVE eigenvalue
+    (~-1e-24) -- numerical garbage from too few samples, since a
+    covariance matrix cannot legitimately be non-PSD. That is what
+    needs correcting, not the magnitude of well-conditioned legitimate
+    eigenvalues.
+
+    Fixed by flooring covariance eigenvalues at max(abs_eig_floor,
+    rel_eps * covariance's own diagonal scale) -- abs_eig_floor is
+    chosen comfortably below the healthy range demonstrated above
+    (~1e-10) and comfortably above the numerical-noise floor seen in
+    the pathological case (~-1e-24) -- instead of capping the
+    resulting information directly. `max_eigval` is kept only as a
+    last-resort safety net (set well above the legitimate range found
+    above, ~1e10) against truly infinite/NaN inputs, not as the
+    primary defense.
+    """
+    cov = 0.5 * (cov + cov.T)
+
+    if not np.all(np.isfinite(cov)):
+        # Found via stress-testing (tests/test_info_cap_headroom.py's
+        # sibling edge-case checks): np.linalg.eigh raises an unhandled
+        # LinAlgError on NaN/Inf input instead of degrading gracefully
+        # (the old eps-ridge code didn't raise here, it just silently
+        # produced a NaN-filled information matrix instead -- neither
+        # is acceptable in a long-running backend that can't afford to
+        # crash on a single bad preintegration). If this ever fires in
+        # production it means something upstream in preintegration.py
+        # produced a non-finite covariance; treat that interval as
+        # having no information at all (an all-zero information
+        # matrix -- i.e. the IMU factor contributes literally nothing,
+        # letting the rest of the graph carry that pose/velocity/bias
+        # unconstrained by this one factor) rather than propagating
+        # the corruption into the solver.
+        print(
+            "[IMU] WARNING: non-finite preintegration covariance -- "
+            "dropping this IMU factor's information to (near-)zero "
+            "instead of crashing or propagating NaNs into the solver."
+        )
+        # NOT an all-zero matrix: downstream _imu_sqrt_information calls
+        # np.linalg.cholesky() on this result, which requires strictly
+        # positive-definite input (PSD/all-zero is not enough) -- an
+        # all-zero return would just move the crash here to a
+        # LinAlgError one line later instead of fixing it. 1e-9 matches
+        # the eigenvalue floor the normal path already applies below,
+        # so this is consistent with "the smallest information this
+        # function ever legitimately produces", not a new magic number.
+        return 1e-9 * np.eye(cov.shape[0])
+
+    diag_scale = max(float(np.diagonal(cov).max()), 1e-12)
+    eig_floor = max(abs_eig_floor, rel_eps * diag_scale)
+    w, V = np.linalg.eigh(cov)
+    w = np.clip(w, eig_floor, None)
+    cov_reg = (V * w) @ V.T
+    cov_reg = 0.5 * (cov_reg + cov_reg.T)
+    information = np.linalg.inv(cov_reg)
+    information = 0.5 * (information + information.T)
+    wi, Vi = np.linalg.eigh(information)
+    wi = np.clip(wi, 1e-9, max_eigval)
+    information = (Vi * wi) @ Vi.T
+    return 0.5 * (information + information.T)
+
+
 def _imu_sqrt_information(covariance, eps=1e-9):
     """
     Dense 15x15 sqrt-information from the preintegration's error-state
     covariance: L such that L @ L.T == inv(covariance).
 
-    A small ridge (eps * I) is added before inversion/Cholesky purely
-    for numerical safety (e.g. very short/near-static intervals can
-    leave the covariance close to singular in some sub-blocks) -- it
-    does not change the physical noise model in any meaningful way.
+    `eps` is kept as a parameter for backward compatibility but is no
+    longer used directly -- see _regularize_information above.
     """
     cov = np.asarray(covariance, dtype=np.float64)
-    cov = 0.5 * (cov + cov.T) + eps * np.eye(cov.shape[0])
-    information = np.linalg.inv(cov)
+    information = _regularize_information(cov)
     # np.linalg.cholesky returns lower-triangular Lc with Lc @ Lc.T == information.
     # We want row-major L (any square root works; Ceres just needs
     # L @ L.T == information for correct weighting), so Lc.T works too --
