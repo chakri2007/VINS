@@ -10,7 +10,60 @@ from typing import Optional
 import numpy as np
 
 from imu.preintegration import PreintegratedIMU
-from optimization.ceres_bundle_adjustment_motion import _regularize_information
+
+
+def robust_sqrt_information(covariance, rel_floor=1e-6, min_floor=1e-12):
+    """
+    Dense sqrt-information L (L @ L.T == inv(covariance_regularized))
+    from a preintegration error-state covariance, regularized in a way
+    that scales with the covariance itself rather than a fixed
+    absolute ridge.
+
+    Why not a fixed `eps * I` ridge (the previous approach here and in
+    ceres_bundle_adjustment_motion.py)? The natural eigenvalues of this
+    covariance span many orders of magnitude depending on which
+    error-state block they belong to (e.g. bias random-walk blocks are
+    tiny even for perfectly healthy, well-sampled intervals -- see the
+    synthetic sweep in tests/test_a_imu_covariance.py). A fixed
+    eps=1e-9 sits far above those natural eigenvalues almost always, so
+    it doesn't just prevent outright singularity -- it silently
+    *replaces* the true (tiny) eigenvalue with eps, and inverting
+    turns that into an information eigenvalue pinned at ~1/eps = 1e9,
+    regardless of how much real data actually supports that direction.
+    That phantom ~1e9-weighted constraint is what was producing the
+    1e6-1e15 initial costs and downstream NO_CONVERGENCE in both
+    BA_motion and the windowed BA.
+
+    Instead, floor each eigenvalue relative to the covariance's own
+    largest eigenvalue (i.e. cap the condition number at 1/rel_floor),
+    so a genuinely well-constrained interval keeps its real,
+    proportionate weighting, and only directions that are degenerate
+    *relative to the rest of this specific interval* get clamped.
+
+    Parameters
+    ----------
+    covariance : (N,N) array
+    rel_floor : float
+        Minimum eigenvalue, as a fraction of the largest eigenvalue
+        (i.e. caps information-matrix condition number at ~1/rel_floor).
+    min_floor : float
+        Absolute floor, only relevant if every eigenvalue is ~0.
+    """
+    cov = np.asarray(covariance, dtype=np.float64)
+    cov = 0.5 * (cov + cov.T)
+
+    eigvals, eigvecs = np.linalg.eigh(cov)
+
+    max_eig = float(eigvals.max())
+    floor = max(rel_floor * max_eig, min_floor)
+
+    eigvals_floored = np.clip(eigvals, floor, None)
+
+    cov_reg = (eigvecs * eigvals_floored) @ eigvecs.T
+    information = np.linalg.inv(cov_reg)
+    information = 0.5 * (information + information.T)
+
+    return np.linalg.cholesky(information)
 
 
 @dataclass
@@ -62,16 +115,4 @@ class IMUFactor:
         if self.information is not None:
             return np.linalg.cholesky(self.information)
 
-        # Bug fix: this used to add a *fixed* eps=1e-9 ridge and invert
-        # directly. Real preintegration covariances for short/degenerate
-        # intervals go as low as ~1e-11 on the diagonal (or are outright
-        # singular), so that fixed ridge silently became the dominant
-        # term, producing information eigenvalues of order 1e9 -- a
-        # single IMU factor able to outweigh every reprojection factor
-        # in the window by many orders of magnitude and wreck the
-        # windowed solver's conditioning (see the matching fix and
-        # longer explanation in ceres_bundle_adjustment_motion.py's
-        # _regularize_information, which this now shares).
-        cov = np.asarray(self.preintegration.covariance, dtype=np.float64)
-        information = _regularize_information(cov)
-        return np.linalg.cholesky(information)
+        return robust_sqrt_information(self.preintegration.covariance)

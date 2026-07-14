@@ -32,19 +32,10 @@ import numpy as np
 
 from optimization.ceres_ba_window import ceres_ba_window
 
-# NOTE: this used to say the C++ cost functor "clamps z to >= 1e-6 and
-# divides", describing a since-fixed bug. The actual current behavior
-# (ceres_ba_window.cpp's ReprojectionErrorFree, matching ceres_ba.cpp
-# and ceres_ba_motion.cpp exactly) is: for z < 1e-3, report a bounded
-# zero residual/zero Jacobian for that one observation instead of
-# dividing by a clamped near-zero z -- a defense-in-depth backstop for
-# any point that drifts behind the camera *during* the solve itself,
-# between one LM step and the next (verified empirically in
-# tests/test_depth_backstop.py: cost stays bounded and the solve
-# converges cleanly even when a point crosses this boundary mid-solve).
-# This Python-side filter's job is different: it keeps such points out
-# of the packed problem *before* solving at all, so they don't cost a
-# wasted residual block/Jacobian evaluation every single iteration.
+# See ceres_bundle_adjustment.py for the full explanation -- same
+# ceres_ba_window.cpp depth clamp (`if (z < 1e-6) z = 1e-6;`) exists in
+# this solver's cost functor too, so the same pre-solve depth filter is
+# needed here.
 MIN_PROJECTION_DEPTH = 1e-3
 
 
@@ -196,16 +187,6 @@ class CeresBundleAdjusterWindow:
         observations = []
         skipped_depth = 0
 
-        # Landmark-culling bookkeeping (see memory_management.sliding_window.
-        # cull_stale_landmarks, called from vio_core.run_windowed_optimization
-        # after optimize() returns): sw_state.landmarks never had any
-        # removal path, so the exact same chronically-degenerate points
-        # (near/behind-camera depth every cycle) kept re-entering this
-        # graph and being skipped here forever. Track both outcomes per
-        # point_id so the caller can act on them once the solve is done.
-        self.last_skipped_point_ids = set()
-        self.last_seen_point_ids = set()
-
         for factor in self.graph.camera_factors:
 
             if factor.view_id not in self.graph.pose_nodes:
@@ -220,10 +201,7 @@ class CeresBundleAdjusterWindow:
             z = float((R.T @ (xyz - C))[2])
             if z <= MIN_PROJECTION_DEPTH:
                 skipped_depth += 1
-                self.last_skipped_point_ids.add(factor.point_id)
                 continue
-
-            self.last_seen_point_ids.add(factor.point_id)
 
             L = factor.sqrt_information
 
