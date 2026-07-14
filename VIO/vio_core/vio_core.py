@@ -15,8 +15,8 @@ from memory_management.sliding_window import (
     append_imu_measurement,
     extract_imu_between,
     prune_imu_before,
-    prune_stale_landmarks,
     build_preintegration,
+    cull_stale_landmarks,
 )
 from imu.imu_measurement import IMUMeasurement
 from vio_core.triangulate import find_triangulation_candidates, triangulate_candidates, add_landmarks
@@ -110,23 +110,15 @@ class VisualInertialOdometry():
             # accumulates against them).
             'graphOptWarmupFrames':          250,
             'graphOptFrequency':             5,
-
-            # Solver time budget for the Phase 3 windowed (full-graph)
-            # optimizer. Previously 0.1s, which -- combined with a
-            # max_iterations of only 10 (see run_windowed_optimization)
-            # -- was too tight for a full ~20-pose/~1000-1500-landmark
-            # window even once the IMU information-matrix conditioning
-            # bug was fixed (see optimization/imu_factor.py's
-            # robust_sqrt_information): synthetic testing at realistic
-            # window scale (synth_tests/test_d2_realistic_scale.py)
-            # showed a healthy, monotonically-converging solve still
-            # needing ~15-25 iterations to satisfy Ceres's convergence
-            # tolerances, taking comfortably under 0.2s once the
-            # per-iteration cost stopped being dominated by badly
-            # conditioned IMU factors. 0.2s keeps real-time margin
-            # while giving the solver room to actually finish instead
-            # of being cut off mid-descent every single call.
-            'baWindowMaxSolverTimeSeconds':  0.2,
+            # Was 0.1s: synthetic testing shows a realistically-sized
+            # window (~2500 obs, 20 IMU factors) needs ~15-20 LM
+            # iterations to actually satisfy Ceres's convergence
+            # tolerances once real pixel noise + occasional degenerate
+            # IMU factors are present -- 0.1s combined with the old
+            # max_iterations=10 was cutting every single windowed BA
+            # off before it finished, not because the problem was too
+            # big for real-time (per-iteration cost here is sub-10ms).
+            'baWindowMaxSolverTimeSeconds':  0.3,
         }
 
         self.feature_extractor = FeatureExtractor(frame_size=(612, 512))
@@ -140,6 +132,20 @@ class VisualInertialOdometry():
         self.isMapInitialized  = False
         self.isVIO_initialized = False
         self.isVI_aligned      = False
+
+        # Diagnostic counter for visual_inertial_optimization's
+        # commit_imu_fallback: consecutive frames in a row that got NO
+        # vision correction at all (pure double-integrated IMU dead
+        # reckoning). One or two in isolation is normal (a momentarily
+        # degenerate interval, or transient PnP/BA_motion rejection).
+        # A long run of these is the signature of a compounding-drift
+        # spiral (see ceres_bundle_adjustment_motion.py's max_iterations
+        # docstring): each fallback frame seeds a worse pose guess for
+        # the next frame's PnP/BA_motion, which is then more likely to
+        # fail too. This alone does not fix that spiral -- it only
+        # makes it visible/measurable in logs instead of being buried
+        # among dozens of individually-unremarkable-looking rejections.
+        self.consecutive_imu_fallback_frames = 0
 
         # Latched once True — mirrors MATLAB's `readyToAlignCameraAndIMU`.
         # Set the first time window_state["isWindowFull"] is seen (i.e.
@@ -246,11 +252,6 @@ class VisualInertialOdometry():
                 self.removed_frame_ids.append(removed_frame_id)
 
             self._prune_imu_buffer()
-
-            n_pruned = prune_stale_landmarks(self.sw_state)
-            if n_pruned:
-                print(f"[VIO] Pruned {n_pruned} stale landmark(s) that fell "
-                      f"out of the sliding window.")
 
             if not self.isMapInitialized:
 
@@ -1081,6 +1082,24 @@ class VisualInertialOdometry():
         for point_id in graph.landmark_nodes:
             self.sw_state.landmarks[point_id].xyz = graph.get_landmark(point_id)
 
+        # Landmark culling -- see memory_management.sliding_window.
+        # cull_stale_landmarks' docstring. Must run after the write-back
+        # above (a point_id updated this cycle must keep that update even
+        # if it's about to be culled for a *different* reason, e.g.
+        # orphaning) and uses the skipped/seen bookkeeping `ba` collected
+        # during _pack_observations for this exact solve.
+        n_chronic, n_orphaned = cull_stale_landmarks(
+            self.sw_state,
+            window_view_ids=list(graph.pose_nodes.keys()),
+            skipped_point_ids=getattr(ba, "last_skipped_point_ids", set()),
+            seen_point_ids=getattr(ba, "last_seen_point_ids", set()),
+        )
+        if n_chronic or n_orphaned:
+            print(
+                f"[VIO] Culled {n_chronic + n_orphaned} stale landmark(s) "
+                f"({n_chronic} chronic depth failures, {n_orphaned} orphaned)."
+            )
+
         return result
 
     def fix_bundle_adjustment_poses(self, window_state):
@@ -1278,6 +1297,20 @@ class VisualInertialOdometry():
             # stale global bootstrap bias.
             self.sw_state.biases[frameID] = self._get_bias(prev_view_id)
 
+            # See __init__'s consecutive_imu_fallback_frames docstring:
+            # this is diagnostic only (surfaces the compounding-drift
+            # spiral in logs), it does not itself alter behavior.
+            self.consecutive_imu_fallback_frames += 1
+            streak = self.consecutive_imu_fallback_frames
+            if streak in (5, 15, 30) or (streak > 30 and streak % 30 == 0):
+                print(
+                    f"[VIO] WARNING: {streak} consecutive frames with NO "
+                    f"vision correction (pure IMU dead reckoning). Pose "
+                    f"drift is very likely compounding uncorrected; "
+                    f"treat any pose/landmark output from this stretch "
+                    f"as unreliable."
+                )
+
         # ---- 2. PnP pose guess for the new frame ------------------------
         correspondences = find_pnp_correspondences(self.sw_state, frameID)
 
@@ -1333,6 +1366,11 @@ class VisualInertialOdometry():
             return False
 
         R_refined, C_refined = refined_pose
+
+        # A real, vision-corrected pose was committed this frame --
+        # the compounding-drift spiral (see commit_imu_fallback) is
+        # broken, reset the streak.
+        self.consecutive_imu_fallback_frames = 0
 
         # ---- 4. Write refined state back ------------------------------------
         self.view_set.add_view(frameID, R_refined, C_refined, timestamp)
